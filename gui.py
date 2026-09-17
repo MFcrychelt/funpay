@@ -334,10 +334,10 @@ def run_tkinter_gui() -> None:
     settings_scroll.pack(side="right", fill="y")
     settings_canvas.pack(side="left", fill="both", expand=True)
 
-    # Прокрутка колёсиком
+    # Прокрутка колёсиком (только над canvas, не глобально)
     def _on_mousewheel(event):
         settings_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    settings_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    settings_canvas.bind("<MouseWheel>", _on_mousewheel)
 
     env = _read_env()
 
@@ -415,7 +415,7 @@ def run_tkinter_gui() -> None:
 
     def _on_mousewheel2(event):
         b_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    b_canvas.bind_all("<MouseWheel>", _on_mousewheel2)
+    b_canvas.bind("<MouseWheel>", _on_mousewheel2)
 
     row = 0
     section_label(b_inner, "⏱ Интервалы", row=row); row += 1
@@ -631,7 +631,7 @@ def run_tkinter_gui() -> None:
 
     def _on_mousewheel3(event):
         r_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-    r_canvas.bind_all("<MouseWheel>", _on_mousewheel3)
+    r_canvas.bind("<MouseWheel>", _on_mousewheel3)
 
     section_label(r_inner, "🎯 Правила лотов: какой лот → сколько звёзд", row=0)
 
@@ -896,6 +896,23 @@ def run_tkinter_gui() -> None:
                                 fg=C["green"] if today_p >= 0 else C["red"])
 
         root.after(2000, refresh)
+
+    # Глобальная вставка Ctrl+V для всех Entry/Text виджетов
+    def _global_paste(event):
+        try:
+            widget = event.widget
+            if isinstance(widget, (tk.Entry, tk.Text)):
+                clipboard = root.clipboard_get()
+                if isinstance(widget, tk.Entry):
+                    widget.insert("insert", clipboard)
+                else:
+                    widget.insert("insert", clipboard)
+        except tk.TclError:
+            pass
+        return "break"
+
+    root.bind("<Control-v>", _global_paste)
+    root.bind("<Control-V>", _global_paste)
 
     root.bind("<F5>", lambda e: refresh())
     root.bind("<Control-q>", lambda e: root.destroy())
