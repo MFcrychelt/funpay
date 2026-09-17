@@ -19,3 +19,12 @@ venv/
 # Артефакты
 build/
 dist/
+
+# Local files
+.bot.pid
+db.json
+state.json
+autostars.db
+*.log
+AutoStars-New/
+AutoStars-New.zip

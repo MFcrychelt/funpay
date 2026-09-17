@@ -80,6 +80,12 @@ class Config:
     # --- Дополнительные правила для лотов ---
     lot_rules: list[dict[str, Any]] = field(default_factory=list)
 
+    # --- Прибыль и настройки выдачи ---
+    hide_sender: bool = False
+    cost_per_star_usd: float = 0.017
+    revenue_per_star_rub: float = 1.5
+    usd_to_rub: float = 100.0
+
     @classmethod
     def load(cls, config_path: str | Path = "config.json") -> "Config":
         """Загружает конфигурацию из .env, config.json и переменных окружения."""

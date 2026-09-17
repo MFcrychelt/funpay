@@ -243,6 +243,7 @@ async def run_test_order(
             default_quantity=quantity,
             max_charge_usdt=cfg.default_max_charge_usdt,
             whitebird_rate=cfg.active_usdt_rate,
+            hide_sender=cfg.hide_sender,
         )
         print(f"Результат тестового заказа: {result}")
     finally:
@@ -306,6 +307,7 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
                                 default_quantity=cfg.default_stars_quantity,
                                 max_charge_usdt=cfg.default_max_charge_usdt,
                                 whitebird_rate=cfg.active_usdt_rate,
+                                hide_sender=cfg.hide_sender,
                             )
                         )
                         tasks.add(task)

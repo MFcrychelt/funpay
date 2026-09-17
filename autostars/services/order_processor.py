@@ -19,6 +19,7 @@ async def process_paid_order(
     default_quantity: int = 1000,
     max_charge_usdt: float = 9.50,
     whitebird_rate: float = 87.63,
+    hide_sender: bool = False,
 ) -> Dict[str, Any]:
     """
     Обрабатывает оплаченный заказ с FunPay.
@@ -104,6 +105,7 @@ async def process_paid_order(
         quantity=quantity,
         order_id=order_id,
         max_charge_usdt=charge_limit,
+        hide_sender=hide_sender,
     )
 
     # Логируем ключ идемпотентности

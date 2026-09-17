@@ -97,6 +97,15 @@ class Config:
     # Уведомления продавцу через Telegram-бота (опционально).
     seller_notify_token: str = ""
     seller_notify_chat_id: str = ""
+    # --- Прибыль ---
+    # Цена закупки 1 звезды в USD (сколько платишь GAMEAU).
+    cost_per_star_usd: float = 0.017
+    # Цена продажи 1 звезды в RUB (сколько берёшь с покупателя).
+    revenue_per_star_rub: float = 1.5
+    # Курс USD→RUB для пересчёта (если 0 — не считать).
+    usd_to_rub: float = 100.0
+    # Скрывать ли имя отправителя у получателя звёзд.
+    hide_sender: bool = False
     # --- Баланс/контроль ---
     min_gameau_balance: float = 0.0
     stop_on_low_balance: bool = False

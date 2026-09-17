@@ -31,6 +31,7 @@ from .gameau import (
     InsufficientBalanceError,
     PriceChangedError,
 )
+from .history import History
 from .logger_setup import get_logger
 from .state import (
     STATUS_DONE,
@@ -83,11 +84,12 @@ class DeliveryEngine:
     """Основной обработчик заказов."""
 
     def __init__(self, cfg: Config, funpay: FunPayClient, gameau: GameauClient,
-                 state: State):
+                 state: State, history: History | None = None):
         self.cfg = cfg
         self.funpay = funpay
         self.gameau = gameau
         self.state = state
+        self.history = history or History()
         self._last_balance_check = 0.0
         self._balance: float | None = None
 
@@ -335,6 +337,7 @@ class DeliveryEngine:
             try:
                 gameau_order = self._create_gameau_order(
                     order_id, username, actual_stars, max_charge, idem_key,
+                    hide_sender=self.cfg.hide_sender,
                 )
             except InsufficientBalanceError:
                 logger.error("Заказ #%s: недостаточно средств на балансе GAMEAU.", order_id)
@@ -402,8 +405,20 @@ class DeliveryEngine:
                                 gameau_order_id=gameau_order_id)
         logger.info("Заказ #%s: %d звёзд отправлено на @%s ✅",
                     order_id, actual_stars, username)
+
+        # Запись в историю транзакций
+        cost_usd = round(price * actual_stars / (self.gameau.package_stars(package) or actual_stars), 4)
+        revenue_rub = round(self.cfg.revenue_per_star_rub * actual_stars, 2)
+        profit = round(revenue_rub - cost_usd * self.cfg.usd_to_rub, 2)
+        self.history.add_transaction(
+            order_id=order_id, username=username, stars=actual_stars,
+            cost_usd=cost_usd, revenue_rub=revenue_rub, profit=profit,
+            gameau_order_id=gameau_order_id, status="done",
+        )
+
         self._notify_seller(
-            f"✅ Заказ #{order_id}: {actual_stars} звёзд отправлено @{username}."
+            f"✅ Заказ #{order_id}: {actual_stars} звёзд отправлено @{username}. "
+            f"Прибыль: {profit:.2f} ₽"
         )
 
         if self.cfg.reply_on_delivery:
@@ -412,10 +427,12 @@ class DeliveryEngine:
             self.funpay.send_message(order, text)
 
     def _create_gameau_order(self, order_id: str, username: str, stars: int,
-                             max_charge: float, idem_key: str) -> dict[str, Any]:
+                             max_charge: float, idem_key: str,
+                             hide_sender: bool = False) -> dict[str, Any]:
         """Создание заказа с одним безопасным повтором при изменении цены."""
         try:
-            return self.gameau.send_stars(username, stars, max_charge, idem_key)
+            return self.gameau.send_stars(username, stars, max_charge, idem_key,
+                                          hide_sender=hide_sender)
         except PriceChangedError as exc:
             new_price = None
             if isinstance(exc.details, dict):
@@ -424,7 +441,8 @@ class DeliveryEngine:
                 max_charge = round(float(new_price) * self.cfg.gameau_max_charge_multiplier, 2)
                 logger.warning("Заказ #%s: цена изменилась, повторяю с maxCharge=%.2f.",
                                order_id, max_charge)
-                return self.gameau.send_stars(username, stars, max_charge, idem_key)
+                return self.gameau.send_stars(username, stars, max_charge, idem_key,
+                                              hide_sender=hide_sender)
             raise
 
     def _handle_gameau_failure(self, order: Any, order_id: str, username: str,

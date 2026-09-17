@@ -143,6 +143,7 @@ class GameauClient:
         order_id: str,
         max_charge_usdt: float = 9.50,
         wait_completion: bool = False,
+        hide_sender: bool = False,
     ) -> Dict[str, Any]:
         """
         Отправляет запрос на покупку Stars с защитой по Idempotency Key и maxCharge.
@@ -158,6 +159,8 @@ class GameauClient:
             "quantity": int(quantity),
             "maxCharge": float(max_charge_usdt),
         }
+        if hide_sender:
+            payload["hide_sender"] = 1
 
         request_headers = {
             **self.headers,

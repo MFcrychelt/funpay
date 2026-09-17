@@ -71,7 +71,8 @@ class FakeGameau:
         return item["order"]["body"]["quantity"]
 
     def send_stars(self, username: str, quantity: int, max_charge: float,
-                   idempotency_key: str | None = None):
+                   idempotency_key: str | None = None,
+                   hide_sender: bool = False):
         self.created.append({
             "username": username, "quantity": quantity,
             "max_charge": max_charge, "idem": idempotency_key,

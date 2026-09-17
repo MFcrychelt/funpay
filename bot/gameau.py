@@ -126,6 +126,14 @@ class GameauClient:
     # ------------------------------------------------------------------ #
     # Публичные методы
     # ------------------------------------------------------------------ #
+    def ping(self) -> bool:
+        """Проверяет доступность API. Возвращает True если сервер отвечает."""
+        try:
+            data = self._request("GET", "account")
+            return bool(data.get("ok") or data.get("account"))
+        except GameauError:
+            return False
+
     def get_account(self) -> dict[str, Any]:
         """Возвращает информацию об аккаунте (баланс, тариф, статус)."""
         data = self._request("GET", "account")
@@ -216,13 +224,15 @@ class GameauClient:
         return None
 
     def send_stars(self, telegram_username: str, quantity: int, max_charge: float,
-                   idempotency_key: str | None = None) -> dict[str, Any]:
+                   idempotency_key: str | None = None,
+                   hide_sender: bool = False) -> dict[str, Any]:
         """Создаёт заказ на отправку звёзд. Возвращает объект заказа.
 
         :param telegram_username: юзернейм получателя (без @).
         :param quantity: количество звёзд.
         :param max_charge: максимальная сумма списания в USD.
         :param idempotency_key: UUID идемпотентности (обязателен для API).
+        :param hide_sender: скрыть имя отправителя у получателя.
         """
         username = telegram_username.strip().lstrip("@")
         key = idempotency_key or str(uuid.uuid4())
@@ -231,6 +241,8 @@ class GameauClient:
             "quantity": int(quantity),
             "maxCharge": round(float(max_charge), 2),
         }
+        if hide_sender:
+            body["hide_sender"] = 1
         logger.info(
             "Создаю заказ GAMEAU: %d звёзд → @%s (maxCharge=%.2f USD, idem=%s)",
             quantity, username, max_charge, key,
