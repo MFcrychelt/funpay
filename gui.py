@@ -897,22 +897,46 @@ def run_tkinter_gui() -> None:
 
         root.after(2000, refresh)
 
-    # Глобальная вставка Ctrl+V для всех Entry/Text виджетов
-    def _global_paste(event):
+    # Вставка Ctrl+V для всех Entry/Text виджетов + правая кнопка мыши
+    def _paste_to_widget(widget):
+        try:
+            clipboard = root.clipboard_get("clipboard")
+        except tk.TclError:
+            try:
+                clipboard = root.clipboard_get("PRIMARY")
+            except tk.TclError:
+                return
+        if isinstance(widget, tk.Entry):
+            widget.delete(0, "end")
+            widget.insert(0, clipboard.strip())
+        elif isinstance(widget, tk.Text):
+            widget.insert("insert", clipboard)
+
+    def _on_ctrl_v(event):
         try:
             widget = event.widget
             if isinstance(widget, (tk.Entry, tk.Text)):
-                clipboard = root.clipboard_get()
-                if isinstance(widget, tk.Entry):
-                    widget.insert("insert", clipboard)
-                else:
-                    widget.insert("insert", clipboard)
-        except tk.TclError:
+                _paste_to_widget(widget)
+        except Exception:
             pass
         return "break"
 
-    root.bind("<Control-v>", _global_paste)
-    root.bind("<Control-V>", _global_paste)
+    def _on_right_click(event):
+        try:
+            widget = event.widget
+            if not isinstance(widget, (tk.Entry, tk.Text)):
+                return
+            menu = tk.Menu(root, tearoff=0, bg=C["surface"], fg=C["fg"],
+                          activebackground=C["accent"], activeforeground=C["bg"],
+                          font=C["font_md"])
+            menu.add_command(label="Вставить", command=lambda w=widget: _paste_to_widget(w))
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+
+    root.bind_all("<Control-v>", _on_ctrl_v)
+    root.bind_all("<Control-V>", _on_ctrl_v)
+    root.bind_all("<Button-3>", _on_right_click)  # Правая кнопка мыши
 
     root.bind("<F5>", lambda e: refresh())
     root.bind("<Control-q>", lambda e: root.destroy())
