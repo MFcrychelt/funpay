@@ -1,36 +1,29 @@
 {
-  "poll_interval": 5.0,
-  "default_stars_quantity": 1000,
-  "default_max_charge_usdt": 9.50,
-  "exchange_variant": 2,
+  "API": {
+    "url": "https://gameau.us/api/v1",
+    "token": "YOUR_GAMEAU_API_KEY",
+    "ping_url": "https://gameau.us/api/v1/ping",
+    "max_charge_usdt": 9.50,
+    "request_timeout": 30
+  },
+  "BOT": {
+    "enabled": 1,
+    "bot_token": "YOUR_BOT_TOKEN_HERE"
+  },
+  "FUNPAY": {
+    "golden_key": "YOUR_FUNPAY_GOLDEN_KEY"
+  },
+  "FINANCE": {
+    "cost_per_star_usd": 0.017,
+    "revenue_per_star_rub": 1.5,
+    "hide_sender": false
+  },
+  "SETTINGS": {
+    "db_path": "db.json",
+    "request_timeout": 10,
+    "order_check_interval": 10,
+    "admin_telegram_id": null
+  },
   "rate_variant_1": 110.0,
-  "rate_variant_2": 87.63,
-  "whitebird_usdt_rate": 87.63,
-  "tron_energy_fee_rub": 0.0,
-  "db_path": "autostars.db",
-  "log_file": "autostars.log",
-
-  "telegram_bot_token": "",
-  "telegram_chat_id": "",
-
-  "lot_rules": [
-    { "pattern": "\\b50\\b", "stars": 50 },
-    { "pattern": "\\b100\\b", "stars": 100 },
-    { "pattern": "\\b250\\b", "stars": 250 },
-    { "pattern": "\\b500\\b", "stars": 500 },
-    { "pattern": "\\b1000\\b", "stars": 1000 }
-  ],
-
-  "hide_sender": false,
-
-  "cost_per_star_usd": 0.017,
-  "revenue_per_star_rub": 1.5,
-  "usd_to_rub": 100.0,
-
-  "gameau_max_charge_multiplier": 1.5,
-  "gameau_status_poll_interval": 5,
-  "gameau_status_timeout": 600,
-
-  "stop_on_low_balance": false,
-  "min_gameau_balance": 0
+  "rate_variant_2": 87.63
 }
