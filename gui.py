@@ -511,7 +511,7 @@ class AutoStarsGUI:
 
 def main():
     def run_flet():
-        flet_run(target=AutoStarsGUI().build)
+        flet_run(AutoStarsGUI().build)
 
     run_flet()
 
