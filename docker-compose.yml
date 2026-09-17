@@ -1,0 +1,14 @@
+services:
+  funpay-stars:
+    build: .
+    container_name: funpay-stars-bot
+    restart: unless-stopped
+    environment:
+      FUNPAY_STARS_STATE: /app/data/state.json
+    volumes:
+      # Секреты и настройки хоста пробрасываем в контейнер.
+      - ./.env:/app/.env:ro
+      - ./config.json:/app/config.json:ro
+      # Состояние и логи сохраняем в каталог ./data на хосте.
+      - ./data:/app/data
+    command: ["python", "main.py"]
