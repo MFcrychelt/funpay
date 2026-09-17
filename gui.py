@@ -8,6 +8,7 @@
 """
 
 import flet as ft
+from flet.app import run as flet_run
 import json
 import asyncio
 import threading
@@ -510,7 +511,7 @@ class AutoStarsGUI:
 
 def main():
     def run_flet():
-        ft.app(target=AutoStarsGUI().build)
+        flet_run(target=AutoStarsGUI().build)
 
     run_flet()
 
