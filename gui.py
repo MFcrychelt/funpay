@@ -305,7 +305,7 @@ class AutoStarsGUI:
                 ]),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             bgcolor=ft.Colors.GREY_900,
-            padding=ft.padding.symmetric(horizontal=20, vertical=12),
+            padding=ft.Padding(left=20, top=12, right=20, bottom=12),
         )
 
         # ═══════════════════ ВКЛАДКИ ═══════════════════ #
