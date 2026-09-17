@@ -273,7 +273,7 @@ class AutoStarsGUI:
             title=ft.Text("🧮 Калькулятор прибыли"),
             content=ft.Column([
                 stars_field,
-                ft.ElevatedButton("Рассчитать", on_click=calc),
+                ft.Button("Рассчитать", on_click=calc),
                 result_text,
             ]),
             actions=[ft.TextButton("Закрыть", on_click=lambda e: page.close(dlg))],
@@ -338,28 +338,28 @@ class AutoStarsGUI:
                             ft.Text("Управление ботом", size=18, weight=ft.FontWeight.BOLD,
                                     color=ft.Colors.WHITE),
                             ft.Row([
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "▶ Запустить",
                                     on_click=self._start_bot,
                                     bgcolor=ft.Colors.GREEN_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.PLAY_ARROW,
                                 ),
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "⏹ Остановить",
                                     on_click=self._stop_bot,
                                     bgcolor=ft.Colors.RED_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.STOP,
                                 ),
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "🔍 Проверить API",
                                     on_click=self._check_connection,
                                     bgcolor=ft.Colors.BLUE_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.WIFI_FIND,
                                 ),
-                                ft.ElevatedButton(
+                                ft.Button(
                                     "🧮 Калькулятор",
                                     on_click=lambda e: self._calc_profit_dialog(e, page),
                                     bgcolor=ft.Colors.PURPLE_800,
@@ -441,7 +441,7 @@ class AutoStarsGUI:
                     ft.Divider(color=ft.Colors.GREY_800),
 
                     # Кнопка сохранения
-                    ft.ElevatedButton(
+                    ft.Button(
                         "💾 Сохранить настройки",
                         on_click=lambda e: self._save_settings(e, fields),
                         bgcolor=ft.Colors.CYAN_800,
@@ -463,7 +463,7 @@ class AutoStarsGUI:
             content=ft.Container(
                 content=ft.Column([
                     ft.Row([
-                        ft.ElevatedButton(
+                        ft.Button(
                             "🔄 Обновить",
                             on_click=self._refresh_stats,
                             bgcolor=ft.Colors.BLUE_800,
@@ -489,7 +489,7 @@ class AutoStarsGUI:
             text="📝 Логи",
             content=ft.Container(
                 content=ft.Column([
-                    ft.ElevatedButton(
+                    ft.Button(
                         "🗑 Очистить",
                         on_click=lambda e: setattr(self.log_list, "controls", []) or e.page.update(),
                         bgcolor=ft.Colors.GREY_800,
