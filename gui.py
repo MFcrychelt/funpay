@@ -760,36 +760,39 @@ def run_tkinter_gui() -> None:
     tk.Label(margin_frame, text="⚙️ Настройки маржи", font=C["font_title"],
              bg=C["mantle"], fg=C["accent"]).pack(anchor="w", pady=(0, 8))
 
+    # Под-frame для grid (чтобы не конфликтовать с pack выше)
+    margin_grid = tk.Frame(margin_frame, bg=C["mantle"])
+    margin_grid.pack(fill="x")
+
     m_row = 0
     for label_text, key, default in [
         ("Закупка 1⭐ (USD):", "cost_per_star_usd", "0.017"),
         ("Продажа 1⭐ (₽):", "revenue_per_star_rub", "1.5"),
         ("Курс USD→₽:", "usd_to_rub", "100"),
     ]:
-        tk.Label(margin_frame, text=label_text, font=C["font_md"],
+        tk.Label(margin_grid, text=label_text, font=C["font_md"],
                  bg=C["mantle"], fg=C["fg"]).grid(row=m_row, column=0, sticky="w", pady=3)
         var = tk.StringVar(value=str(cfg.get(key, default)))
-        entry = tk.Entry(margin_frame, width=12, textvariable=var, font=C["font"],
+        entry = tk.Entry(margin_grid, width=12, textvariable=var, font=C["font"],
                          bg=C["surface"], fg=C["fg"], insertbackground=C["fg"], relief="flat")
         entry.grid(row=m_row, column=1, sticky="w", padx=(8, 0), pady=3)
         m_row += 1
 
     hide_var = tk.BooleanVar(value=cfg.get("hide_sender", False))
-    tk.Checkbutton(margin_frame, text="Скрывать отправителя звёзд",
+    tk.Checkbutton(margin_grid, text="Скрывать отправителя звёзд",
                     variable=hide_var, font=C["font_md"],
                     bg=C["mantle"], fg=C["fg"], selectcolor=C["surface"],
                     activebackground=C["mantle"]).grid(row=m_row, column=0,
                     columnspan=2, sticky="w", pady=6)
 
-    margin_status = tk.Label(margin_frame, text="", font=C["font_md"],
+    margin_btn_frame = tk.Frame(margin_frame, bg=C["mantle"])
+    margin_btn_frame.pack(anchor="w", pady=(8, 0))
+
+    margin_status = tk.Label(margin_btn_frame, text="", font=C["font_md"],
                              bg=C["mantle"], fg=C["green"])
 
     def save_margin():
-        cfg["cost_per_star_usd"] = float(margin_frame.winfo_children()[3].get()
-                                          if hasattr(margin_frame.winfo_children()[3], 'get')
-                                          else cfg.get("cost_per_star_usd", 0.017))
-        # Простой способ — перечитать из grid
-        entries = [w for w in margin_frame.winfo_children() if isinstance(w, tk.Entry)]
+        entries = [w for w in margin_grid.winfo_children() if isinstance(w, tk.Entry)]
         if len(entries) >= 3:
             cfg["cost_per_star_usd"] = float(entries[0].get())
             cfg["revenue_per_star_rub"] = float(entries[1].get())
@@ -799,11 +802,11 @@ def run_tkinter_gui() -> None:
         margin_status.config(text="✅ Сохранено", fg=C["green"])
         root.after(3000, lambda: margin_status.config(text=""))
 
-    save_margin_btn = tk.Button(margin_frame, text="💾 Сохранить", command=save_margin,
+    save_margin_btn = tk.Button(margin_btn_frame, text="💾 Сохранить", command=save_margin,
                                  font=C["font_title"], bg=C["accent"], fg="#1e1e1e",
                                  relief="flat", padx=12, pady=4, cursor="hand2")
-    save_margin_btn.grid(row=m_row + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-    margin_status.grid(row=m_row + 1, column=2, sticky="w", padx=(12, 0))
+    save_margin_btn.pack(side="left")
+    margin_status.pack(side="left", padx=(12, 0))
 
     # ══════════════════════════════════════════════════════════════════════ #
     # Обновление данных
