@@ -135,20 +135,71 @@ def test_extract_stars_quantity(text, expected_stars):
 # 3. ТЕСТЫ ФИНАНСОВОЙ МОДЕЛИ И TELEGRAM ALERT (Шаг 5)
 # ============================================================================ #
 def test_whitebird_profit_calculation():
-    notifier = TelegramNotifier(whitebird_rate=87.63, tron_energy_fee_rub=0.0)
+    notifier = TelegramNotifier(rate_variant_1=110.0, rate_variant_2=87.63, active_variant=2)
 
     # 1000 Stars = 9.10 USDT в Gameau API
-    # Себестоимость: 9.10 * 87.63 = 797.433 RUB
+    # Себестоимость Вариант 2 (Whitebird): 9.10 * 87.63 = 797.433 RUB
     # Выручка на FunPay: 1370.40 RUB
     # Чистая прибыль: 1370.40 - 797.433 = 572.967 -> 572.97 RUB!
-    profit = notifier.calculate_profit(order_price_rub=1370.40, usdt_cost=9.10)
-    assert profit == 572.97
+    profit_v2 = notifier.calculate_profit(order_price_rub=1370.40, usdt_cost=9.10, rate=87.63)
+    assert profit_v2 == 572.97
 
-    # С учетом комиссии сети TRON Energy (например 15 RUB)
-    profit_with_tron = notifier.calculate_profit(
-        order_price_rub=1370.40, usdt_cost=9.10, tron_energy_rub=15.0
-    )
-    assert profit_with_tron == round(572.97 - 15.0, 2)
+    # Себестоимость Вариант 1 (Анонимный обмен): 9.10 * 110.0 = 1001.00 RUB
+    # Чистая прибыль: 1370.40 - 1001.00 = 369.40 RUB
+    profit_v1 = notifier.calculate_profit(order_price_rub=1370.40, usdt_cost=9.10, rate=110.00)
+    assert profit_v1 == 369.40
+
+    # Сравнение через get_profit_summary
+    summary = notifier.get_profit_summary(order_price_rub=1370.40, usdt_cost=9.10)
+    assert summary["variant_1"]["profit_rub"] == 369.40
+    assert summary["variant_2"]["profit_rub"] == 572.97
+    assert summary["active_profit_rub"] == 572.97
+
+
+@pytest.mark.anyio
+async def test_gameau_catalog_parsing_and_find_package():
+    fake_catalog = {
+        "ok": True,
+        "catalog": {
+            "items": [
+                {"name": "Telegram Stars 100", "price": 0.95, "orderable": True, "order": {"body": {"quantity": 100}}},
+                {"name": "Telegram Stars 250", "price": 2.30, "orderable": True, "order": {"body": {"quantity": 250}}},
+                {"name": "Telegram Stars 500", "price": 4.55, "orderable": True, "order": {"body": {"quantity": 500}}},
+                {"name": "Telegram Stars 1000", "price": 9.10, "orderable": True, "order": {"body": {"quantity": 1000}}},
+            ]
+        }
+    }
+
+    def mock_catalog_transport(request: httpx.Request):
+        if "catalog" in request.url.path:
+            return httpx.Response(200, json=fake_catalog)
+        return httpx.Response(404)
+
+    client = GameauClient("TEST_KEY", base_url="https://gameau.us/api/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(mock_catalog_transport)) as ac:
+        # Патчим вызов httpx в клиенте
+        original_get_catalog = client.get_catalog
+
+        async def mocked_get_catalog(**kwargs):
+            resp = await ac.get("https://gameau.us/api/v1/catalog?type=telegramStars")
+            data = resp.json()
+            return data["catalog"]["items"]
+
+        client.get_catalog = mocked_get_catalog
+
+        # 1. Поиск точного пакета 1000 звёзд
+        pkg_1000 = await client.find_stars_package(1000)
+        assert pkg_1000 is not None
+        assert client.extract_item_stars(pkg_1000) == 1000
+        assert pkg_1000["price"] == 9.10
+
+        # 2. Поиск пакета на 200 звёзд (точного нет -> берется 250)
+        pkg_200 = await client.find_stars_package(200)
+        assert pkg_200 is not None
+        assert client.extract_item_stars(pkg_200) == 250
+
+        # 3. Извлечение количества звёзд
+        assert client.extract_item_stars({"name": "Telegram Stars 500"}) == 500
 
 
 @pytest.mark.anyio
@@ -361,11 +412,24 @@ class MockNotifier:
     def __init__(self):
         self.alerts = []
         self.whitebird_rate = 87.63
+        self.rate_variant_1 = 110.00
+        self.rate_variant_2 = 87.63
 
-    def calculate_profit(self, order_price_rub, usdt_cost, tron_energy_rub=None):
-        return round(order_price_rub - (usdt_cost * self.whitebird_rate), 2)
+    def calculate_profit(self, order_price_rub, usdt_cost, rate=None, tron_energy_rub=None):
+        r = rate or self.whitebird_rate
+        return round(order_price_rub - (usdt_cost * r), 2)
 
     async def send_alert(self, text, parse_mode="HTML"):
+        self.alerts.append(text)
+        return True
+
+    async def alert_order_completed(self, order_id, username, profit_rub=572.97, order_price_rub=None, usdt_cost=9.10):
+        text = f"💰 Заказ #{order_id} выполнен! +{profit_rub:.2f} RUB чистой прибыли (Отправлено @{username})"
+        self.alerts.append(text)
+        return True
+
+    async def alert_low_balance(self, order_id):
+        text = f"🚨 <b>ОШИБКА: НИЗКИЙ БАЛАНС GAMEAU!</b> Заказ #{order_id} остановлен. Срочно пополните USDT через Whitebird!"
         self.alerts.append(text)
         return True
 

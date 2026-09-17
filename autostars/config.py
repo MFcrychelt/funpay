@@ -46,15 +46,27 @@ class Config:
 
     # --- Gameau ---
     gameau_key: str = ""
-    gameau_base_url: str = "https://gameau.us/api"
+    gameau_base_url: str = "https://gameau.us/api/v1"
     default_max_charge_usdt: float = 9.50
     default_stars_quantity: int = 1000
     gameau_timeout: float = 15.0
     gameau_max_retries: int = 3
 
-    # --- Financial Model (Whitebird USDT + TRON) ---
-    whitebird_usdt_rate: float = 87.63  # RUB за 1 USDT
+    # --- Financial Model (Crypto USDT TRC-20 Exchange Variants) ---
+    # Вариант 1: Анонимный обмен / P2P (курс ~110.00 RUB за 1 USDT)
+    # Вариант 2: Беларусь Whitebird без P2P (курс ~87.63 RUB за 1 USDT)
+    exchange_variant: int = 2
+    rate_variant_1: float = 110.00  # RUB за 1 USDT (анонимный обмен)
+    rate_variant_2: float = 87.63   # RUB за 1 USDT (Whitebird Беларусь)
+    whitebird_usdt_rate: float = 87.63  # Синоним rate_variant_2
     tron_energy_fee_rub: float = 0.0
+
+    @property
+    def active_usdt_rate(self) -> float:
+        """Возвращает курс USDT в зависимости от выбранного варианта пополнения."""
+        if self.exchange_variant == 1:
+            return self.rate_variant_1
+        return self.rate_variant_2
 
     # --- Telegram Notifier ---
     telegram_bot_token: str = ""
@@ -106,7 +118,10 @@ class Config:
             "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
             "telegram_bot_token": "telegram_bot_token",
             "TELEGRAM_CHAT_ID": "telegram_chat_id",
-            "WHITEBIRD_USDT_RATE": "whitebird_usdt_rate",
+            "EXCHANGE_VARIANT": "exchange_variant",
+            "RATE_VARIANT_1": "rate_variant_1",
+            "RATE_VARIANT_2": "rate_variant_2",
+            "WHITEBIRD_USDT_RATE": "rate_variant_2",
             "DB_PATH": "db_path",
             "DEFAULT_MAX_CHARGE_USDT": "default_max_charge_usdt",
             "DEFAULT_STARS_QUANTITY": "default_stars_quantity",

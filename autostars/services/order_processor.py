@@ -1,4 +1,4 @@
-"""Главная бизнес-логика обработки заказов (FunPay -> Parsing -> Gameau -> Ответ FunPay -> TG Alert)."""
+"""Главная бизнес-логика обработки заказов (FunPay -> Parsing -> Gameau Catalog & Buy -> Ответ FunPay -> TG Alert)."""
 
 from __future__ import annotations
 
@@ -25,9 +25,10 @@ async def process_paid_order(
 
     1. Проверка идемпотентности в БД.
     2. Извлечение Telegram username.
-    3. Вызов Gameau API с Idempotency-Key и контролем maxCharge.
-    4. Отправка подтверждения покупателю на FunPay.
-    5. Telegram alert владельцу с расчётом чистой прибыли.
+    3. Синхронизация с каталогом Gameau (при наличии).
+    4. Вызов Gameau API с Idempotency-Key и контролем maxCharge.
+    5. Отправка подтверждения покупателю на FunPay.
+    6. Telegram alert владельцу с расчётом чистой прибыли по двум вариантам (110 ₽ vs 87.63 ₽).
     """
     order_id = str(order_data["id"])
     chat_node = order_data.get("chat_node") or order_id
@@ -76,6 +77,18 @@ async def process_paid_order(
         or default_quantity
     )
 
+    # Проверяем каталог Gameau для уточнения цены пакета, если доступно
+    charge_limit = float(order_data.get("max_charge_usdt") or max_charge_usdt)
+    if hasattr(gameau_client, "find_stars_package"):
+        try:
+            package = await gameau_client.find_stars_package(quantity)
+            if package and package.get("price"):
+                cat_price = float(package["price"])
+                # Задаем maxCharge с разумным запасом или по цене каталога
+                charge_limit = round(max(charge_limit, cat_price * 1.05), 2)
+        except Exception as exc:
+            logger.debug(f"[ORDER {order_id}] Проверка каталога пропущена: {exc}")
+
     # 3. Фиксируем статус 'PROCESSING' в БД
     await db.save_order_status(
         order_id=order_id,
@@ -90,7 +103,7 @@ async def process_paid_order(
         username=username,
         quantity=quantity,
         order_id=order_id,
-        max_charge_usdt=max_charge_usdt,
+        max_charge_usdt=charge_limit,
     )
 
     # Логируем ключ идемпотентности
@@ -98,7 +111,7 @@ async def process_paid_order(
         await db.log_idempotency(
             idempotency_key=result["idempotency_key"],
             order_id=order_id,
-            request_payload=f"username={username}&qty={quantity}",
+            request_payload=f"username={username}&qty={quantity}&maxCharge={charge_limit}",
             response_payload=str(result.get("data") or result.get("error")),
             status="SUCCESS" if result.get("success") else "FAILED",
         )
@@ -134,14 +147,28 @@ async def process_paid_order(
         )
         await funpay_client.send_message(node=chat_node, text=reply_text)
 
-        # Уведомляем владельца в TG-бота
-        await tg_notifier.send_alert(
-            f"💰 Заказ #{order_id} выполнен! +{profit_rub:.2f} RUB чистой прибыли (Отправлено @{username})"
-        )
-        return {"status": "completed", "order_id": order_id, "username": username, "profit_rub": profit_rub}
+        # Уведомляем владельца в TG-бота с анализом прибыльности обоих вариантов
+        if hasattr(tg_notifier, "alert_order_completed"):
+            await tg_notifier.alert_order_completed(
+                order_id=order_id,
+                username=username,
+                profit_rub=profit_rub,
+                order_price_rub=order_price_rub,
+                usdt_cost=usdt_cost,
+            )
+        else:
+            await tg_notifier.send_alert(
+                f"💰 Заказ #{order_id} выполнен! +{profit_rub:.2f} RUB чистой прибыли (Отправлено @{username})"
+            )
+        return {
+            "status": "completed",
+            "order_id": order_id,
+            "username": username,
+            "profit_rub": profit_rub,
+        }
 
     elif result["error"] == "LOW_BALANCE":
-        # Критическая ошибка баланса — высылаем алерт владельцу
+        # Критическая ошибка баланса — высылаем алерт владельцу с инструкциями по пополнению USDT TRC-20
         await db.save_order_status(
             order_id=order_id,
             username=username,
@@ -150,9 +177,12 @@ async def process_paid_order(
             quantity=quantity,
             error="LOW_BALANCE",
         )
-        await tg_notifier.send_alert(
-            f"🚨 <b>ОШИБКА: НИЗКИЙ БАЛАНС GAMEAU!</b> Заказ #{order_id} остановлен. Срочно пополните USDT через Whitebird!"
-        )
+        if hasattr(tg_notifier, "alert_low_balance"):
+            await tg_notifier.alert_low_balance(order_id)
+        else:
+            await tg_notifier.send_alert(
+                f"🚨 <b>ОШИБКА: НИЗКИЙ БАЛАНС GAMEAU!</b> Заказ #{order_id} остановлен. Срочно пополните USDT через Whitebird!"
+            )
         return {"status": "failed", "error": "LOW_BALANCE", "order_id": order_id}
 
     elif result["error"] == "PRICE_EXCEEDED":
@@ -164,9 +194,12 @@ async def process_paid_order(
             quantity=quantity,
             error="PRICE_EXCEEDED",
         )
-        await tg_notifier.send_alert(
-            f"⚠️ <b>ВНИМАНИЕ:</b> Превышен лимит стоимости maxCharge ({max_charge_usdt} USDT) для заказа #{order_id}!"
-        )
+        if hasattr(tg_notifier, "alert_price_exceeded"):
+            await tg_notifier.alert_price_exceeded(order_id, charge_limit)
+        else:
+            await tg_notifier.send_alert(
+                f"⚠️ <b>ВНИМАНИЕ:</b> Превышен лимит стоимости maxCharge ({charge_limit} USDT) для заказа #{order_id}!"
+            )
         return {"status": "failed", "error": "PRICE_EXCEEDED", "order_id": order_id}
 
     else:
