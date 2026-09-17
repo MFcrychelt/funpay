@@ -1,204 +1,118 @@
-# FunPay Stars Bot — автовыдача Telegram Stars через GAMEAU
+# AutoStars (FunPay <-> Gameau Engine)
 
-Бот полностью автоматизирует продажу и выдачу **Telegram Stars** на
-[FunPay](https://funpay.com) с отправкой звёзд через
-[GAMEAU API](https://gameau.us/api-docs.html?section=catalog).
+Современный, полностью асинхронный и отказоустойчивый стек автовыдачи **Telegram Stars** на [FunPay](https://funpay.com) с интеграцией B2B API **Gameau** и финансовой моделью **Whitebird USDT (+ TRON Energy)**.
 
-## Как это работает
+---
+
+## 1. Архитектурные преимущества новой версии
+
+| Проблема старых версий | Риск / Последствия | Решение в новой архитектуре AutoStars |
+| :--- | :--- | :--- |
+| **Синхронный `requests` / `time.sleep`** | Пропуск заказов при высокой активности, задержка ответа 10–30 сек. | **`asyncio` + `httpx` (Connection Pool, HTTP/2)** — параллельная неблокирующая обработка. |
+| **Отсутствие `Idempotency-Key`** | Сетевой сбой во время запроса = **двойная покупка Stars** и потеря USDT. | **UUID v5/v4 Idempotency Key** на каждый `order_id` в SQLite/`aiosqlite`. |
+| **Отсутствие контроля цены (`maxCharge`)** | Поставщик поднял цену = **списание баланса в минус**. | Передача параметра `maxCharge` в Gameau API и превентивная остановка сделки. |
+| **Жесткий / ненадежный Regex** | Покупатель написал `t.me/nick` или `@nick_1` — скрипт клинит. | Нормализация юзернеймов с авто-фоллбэком и запросом уточнения в чат FunPay. |
+| **Устаревший CSRF на FunPay** | Блокировка за частые запросы страниц или просроченный токен. | Динамическое извлечение `csrf_token` из `data-app-data` + автообновление при `403 Forbidden`. |
+
+---
+
+## 2. Структура проекта
 
 ```
-Покупатель оплачивает лот на FunPay
-        │
-        ▼
-Бот видит новый заказ «оплачен» ──► определяет количество звёзд
-        │                            (правила лотов / парсинг названия)
-        ▼
-Ищет юзернейм Telegram: в описании заказа, затем в чате заказа
-        │
-        ├── юзернейма нет ──► просит покупателя прислать @юзернейм,
-        │                      напоминает раз в час, ждёт до суток
-        ▼
-Отправляет звёзды через GAMEAU API (POST /orders/telegramStars)
-и дожидается статуса «выполнено»
-        │
-        ▼
-Пишет покупателю подтверждение; заказ фиксируется как выданный
+autostars/
+├── config.py             # Загрузка переменных (golden_key, gameau_key, telegram_bot_token)
+├── database/
+│   ├── models.py         # AIOSQLite схемы (orders, idempotency_logs, settings)
+│   └── db_manager.py     # Асинхронные методы CRUD
+├── clients/
+│   ├── funpay.py         # Long Polling runner/, extraction csrf_token, postMessage, 403 recovery
+│   └── gameau.py         # B2B API client, maxCharge, retry with exponential backoff
+├── services/
+│   ├── parser.py         # Regex engine для Telegram handles (ссылки, @тэги, фоллбэк)
+│   └── order_processor.py# Главная бизнес-логика (Оплата FP -> Parsing -> Gameau -> Ответ FP -> TG Alert)
+├── notifier/
+│   └── tg_alert.py       # Telegram бот для уведомления владельца (алерты прибыли и баланса USDT)
+└── main.py               # Точка входа (Async loop)
 ```
 
-Ключевые свойства:
+---
 
-* **Безопасность от двойной выдачи.** Для каждого заказа генерируется
-  `Idempotency-Key` (UUID) и сохраняется в `state.json`. Даже после
-  аварийной перезагрузки бот повторит запрос с тем же ключом — GAMEAU не
-  спишет звёзды дважды.
-* **Юзернеймы распознаются в любом виде:** `@username`, `t.me/username`,
-  `тг: username`, отдельным словом в сообщении, а также в описании заказа.
-* **Количество звёзд** берётся из правил по названию лота, парсится из
-  текста («100 звёзд», «250 stars», «⭐ 500») или задаётся значением по
-  умолчанию; при мультипокупке (×2, ×3) количество умножается.
-* Если точного пакета в каталоге GAMEAU нет, отправляется **ближайший
-  больший**, чтобы покупатель получил не меньше оплаченного.
-* Контроль баланса GAMEAU, автоповторы при сбоях, возврат средств
-  покупателю (опционально), уведомления продавцу в Telegram.
+## 3. Финансовая модель (Whitebird USDT + TRON Energy)
 
-## Установка
+Расчёт чистой прибыли по каждой сделке производится по формуле:
 
-Требуется **Python 3.10+**.
+$$\text{Себестоимость} = (\text{USDT Cost} \times \text{Курс Whitebird}) + \text{TRON Energy Fee}$$
 
+$$\text{Чистая прибыль} = \text{FunPay Выручка (RUB)} - \text{Себестоимость}$$
+
+* **Пример:** 1 000 Stars = 9.10 USDT.
+* При курсе Whitebird **87.63 RUB/USDT** себестоимость составляет $9.10 \times 87.63 = 797.43$ RUB.
+* При продаже лота на FunPay за 1 370.40 RUB чистая прибыль составляет **+572.97 RUB**.
+* При недостатке баланса USDT бот мгновенно отправляет критический алерт владельцу в Telegram с напоминанием пополнить кошелёк через Whitebird.
+
+---
+
+## 4. Чек-лист миграции с AutoStars
+
+- [x] **Шаг 1: Извлечение конфигов.** Скопировать `golden_key` из браузера и API-ключ с личного кабинета Gameau.
+- [x] **Шаг 2: Настройка базы данных SQLite.** Создать таблицы `orders` (поля: `order_id`, `username`, `status`, `created_at`) и `idempotency_keys` / `idempotency_logs`.
+- [x] **Шаг 3: Тестирование метода Long Polling (`runner/`).** Обеспечить автопереполучение `csrf_token` при ответе `403 Forbidden`.
+- [x] **Шаг 4: Тест парсера утилитой unit-тестов.** Прогнать тестовые строки реальных покупателей через модуль `parser.py`.
+- [x] **Шаг 5: Интеграция с Telegram Alert Ботом.** Настроить уведомления о каждой успешной сделке с калькуляцией чистой прибыли (по схеме Whitebird 87.63 RUB).
+- [x] **Шаг 6: Запуск в тестовом режиме.** Запуск бота на 1-2 тестовых заказах с минимальным количеством Stars (`--test-order`).
+
+---
+
+## 5. Установка и запуск
+
+### Требования
+* Python 3.10+
+* `httpx`, `aiosqlite`, `beautifulsoup4`, `pytest`
+
+### Установка зависимостей
 ```bash
-git clone https://github.com/MFcrychelt/funpay.git
-cd funpay
-
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 1. Получите ключи
-
-| Ключ | Где взять |
-| --- | --- |
-| `FUNPAY_GOLDEN_KEY` | Браузер: войдите в аккаунт на FunPay → откройте `https://funpay.com/orders/trade` → инструменты разработчика → куки сайта → значение `golden_key`. Это секрет вашего аккаунта — никому не передавайте. |
-| `GAMEAU_API_KEY` | Профиль на [gameau.us](https://gameau.us) → «API для интеграций» → «Выпустить ключ». Ключ показывается один раз. |
-
-### 2. Настройте бота
-
+### Настройка конфигурации
+Скопируйте пример файла переменных окружения:
 ```bash
-cp .env.example .env             # впишите оба ключа
-cp config.example.json config.json   # при необходимости подкрутите правила
+cp .env.example .env
+```
+Заполните обязательные параметры:
+```env
+FUNPAY_GOLDEN_KEY=ваш_golden_key_из_куки
+GAMEAU_API_KEY=ваш_api_ключ_gameau
+TELEGRAM_BOT_TOKEN=токен_бота_для_уведомлений
+TELEGRAM_CHAT_ID=chat_id_владельца
+WHITEBIRD_USDT_RATE=87.63
+DEFAULT_MAX_CHARGE_USDT=9.50
 ```
 
-### 3. Проверьте подключение
-
+### Диагностика системы
+Проверка подключений к FunPay, Gameau, базы данных и Telegram-бота:
 ```bash
 python main.py --check
 ```
 
-Вывод должен показать успешный вход в FunPay, баланс и тариф GAMEAU, а также
-доступные пакеты звёзд с ценами.
-
-### 4. Запустите
-
+### Тестовый заказ (Шаг 6)
+Проверка отправки минимального пакета Stars на указанный Telegram-аккаунт:
 ```bash
-python main.py           # бесконечный цикл автовыдачи
-python main.py --once    # один проход по очереди (для планировщика)
-python main.py -v        # подробный отладочный лог
+python main.py --test-order durov --test-qty 50
 ```
 
-Журнал пишется в `bot.log`, состояние — в `state.json`.
-
-## Настройка лотов на FunPay
-
-Чтобы автовыдача работала «из коробки», в описании лота укажите:
-
-1. количество звёзд словами/цифрами: **«100 звёзд», «250 Telegram Stars», «⭐ 500»** —
-   бот распознает количество автоматически;
-2. инструкцию покупателю: *«После оплаты отправьте в чат заказа ваш юзернейм
-   Telegram (@username)»* — даже если покупатель её проигнорирует, бот сам
-   попросит юзернейм и дождётся ответа.
-
-Рекомендуется, чтобы количество звёзд в лотах совпадало с пакетами из
-каталога GAMEAU (посмотреть можно через `python main.py --check`) — иначе
-бот округлит количество до ближайшего большего пакета.
-
-### Правила лотов (`lot_rules`)
-
-Если названия лотов нестандартные, добавьте явные правила в `config.json`
-(проверяются по порядку, первое совпадение выигрывает):
-
-```json
-"lot_rules": [
-  { "pattern": "стартовый",        "stars": 50  },
-  { "pattern": "премиум пакет",   "stars": 250 },
-  { "pattern": "\\b1000\\b",      "stars": 1000 }
-]
-```
-
-`pattern` — регулярное выражение (без учёта регистра), ищется в названии
-заказа. Количество дополнительно умножается на число купленных лотов
-(мультидоставка).
-
-## Параметры конфигурации (`config.json`)
-
-| Параметр | По умолчанию | Описание |
-| --- | --- | --- |
-| `poll_interval` | `15` | Интервал опроса заказов, сек. |
-| `session_refresh_interval` | `2700` | Обновление сессии FunPay, сек (раз в 45 мин). |
-| `lot_rules` | `[]` | Правила «название лота → количество звёзд». |
-| `default_stars` | `null` | Количество звёзд, если ничего не распознано. |
-| `ask_username_in_chat` | `true` | Просить юзернейм в чате, если его нет. |
-| `username_wait_timeout` | `86400` | Сколько ждать юзернейм, сек (по умолчанию сутки). |
-| `remind_username` | `true` | Напоминать покупателю, пока юзернейм не получен. |
-| `reminder_interval` | `3600` | Интервал напоминаний, сек. |
-| `reply_on_delivery` | `true` | Писать покупателю подтверждение после выдачи. |
-| `refund_on_failure` | `false` | Автовозврат средств, если выдача провалилась. |
-| `max_create_attempts` | `3` | Попыток создания заказа в GAMEAU до фатальной ошибки. |
-| `msg_*` | см. пример | Тексты сообщений покупателю (`{username}`, `{stars}` — подстановки). |
-| `gameau_max_charge_multiplier` | `1.5` | Лимит списания = цена пакета × множитель (защита от скачка курса). |
-| `gameau_status_poll_interval` | `5` | Интервал опроса статуса заказа GAMEAU, сек. |
-| `gameau_status_timeout` | `600` | Максимум ожидания завершения заказа, сек. |
-| `stop_on_low_balance` / `min_gameau_balance` | `false` / `0` | Пауза выдачи при низком балансе. |
-| `seller_notify_token` / `seller_notify_chat_id` | `""` | Уведомления продавцу через своего Telegram-бота. |
-| `log_file` | `bot.log` | Файл журнала. |
-
-## Запуск 24/7
-
-### systemd (Linux-сервер)
-
-```ini
-# /etc/systemd/system/funpay-stars.service
-[Unit]
-Description=FunPay Stars auto-delivery bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=funpaybot
-WorkingDirectory=/opt/funpay
-ExecStart=/opt/funpay/.venv/bin/python main.py
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
+### Основной запуск
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now funpay-stars
-journalctl -u funpay-stars -f
+python main.py            # бесконечный асинхронный цикл автовыдачи
+python main.py --once     # однократный проход по очереди
+python main.py -v         # подробный отладочный лог
 ```
 
-### Docker
+---
 
+## 6. Запуск тестов
+
+Прогон всех тестов (парсер, база данных, Gameau API, FunPay Long Polling с защитой от 403, Telegram Alert, Order Processor):
 ```bash
-cp .env.example .env      # заполните ключи
-cp config.example.json config.json
-mkdir -p data
-docker compose up -d --build
-docker compose logs -f
+pytest tests/ -v
 ```
-
-## Тесты
-
-```bash
-pip install pytest
-pytest tests/ -q
-```
-
-Тесты покрывают распознавание юзернеймов, определение количества звёзд и
-полный цикл выдачи на моках (без сети).
-
-## Безопасность и ограничения
-
-* `golden_key` FunPay и API-ключ GAMEAU — **секреты**: храните их только в
-  `.env` (файл в `.gitignore`), не публикуйте в коде и репозиториях.
-* Бот использует неофициальный API FunPay (библиотека
-  [FunPayAPI](https://pypi.org/project/FunPayAPI/)). Интерфейс сайта может
-  измениться — обновляйте библиотеку при проблемах.
-* Бот выдаёт товар сообщением в чат заказа — это стандартная схема
-  автовыдачи на FunPay. После отправки звёзд не забудьте, что покупатель
-  подтверждает заказ сам; спорные ситуации решайте через чат.
-* При `503/429` от GAMEAU бот повторяет запрос с тем же
-  `Idempotency-Key` — это безопасно и предписано документацией.

@@ -5,6 +5,7 @@ state.json
 state.broken-*.json
 bot.log
 *.log
+*.db
 
 # Python
 __pycache__/

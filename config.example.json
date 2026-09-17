@@ -1,6 +1,14 @@
 {
-  "poll_interval": 15,
-  "session_refresh_interval": 2700,
+  "poll_interval": 5.0,
+  "default_stars_quantity": 1000,
+  "default_max_charge_usdt": 9.50,
+  "whitebird_usdt_rate": 87.63,
+  "tron_energy_fee_rub": 0.0,
+  "db_path": "autostars.db",
+  "log_file": "autostars.log",
+
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
 
   "lot_rules": [
     { "pattern": "\\b50\\b", "stars": 50 },
@@ -8,30 +16,5 @@
     { "pattern": "\\b250\\b", "stars": 250 },
     { "pattern": "\\b500\\b", "stars": 500 },
     { "pattern": "\\b1000\\b", "stars": 1000 }
-  ],
-  "default_stars": null,
-
-  "username_wait_timeout": 86400,
-  "username_check_interval": 30,
-  "ask_username_in_chat": true,
-  "remind_username": true,
-  "reminder_interval": 3600,
-  "reply_on_delivery": true,
-
-  "refund_on_failure": false,
-
-  "msg_need_username": "Спасибо за покупку! 🙌\nЧтобы я отправил звёзды, пришлите в этот чат ваш юзернейм Telegram (например, @username).",
-  "msg_username_reminder": "Напоминаю: для выдачи звёзд жду ваш юзернейм Telegram (например, @username).",
-  "msg_stars_sent": "⭐ Звёзды отправлены на @{username}!\nКоличество: {stars}.\nПроверьте баланс и подтвердите заказ, пожалуйста. Спасибо за покупку! 🙏",
-  "msg_error": "Произошла ошибка при выдаче звёзд. Я уже сообщил продавцу, вопрос решим — ожидайте, пожалуйста.",
-
-  "gameau_max_charge_multiplier": 1.5,
-  "gameau_status_poll_interval": 5,
-  "gameau_status_timeout": 600,
-
-  "stop_on_low_balance": false,
-  "min_gameau_balance": 0,
-
-  "seller_notify_token": "",
-  "seller_notify_chat_id": ""
+  ]
 }
