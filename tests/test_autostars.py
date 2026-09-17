@@ -385,7 +385,7 @@ class MockGameauClient:
         self.mode = mode
         self.calls = []
 
-    async def buy_telegram_stars(self, username, quantity, order_id, max_charge_usdt=9.50):
+    async def buy_telegram_stars(self, username, quantity, order_id, max_charge_usdt=9.50, hide_sender=False):
         self.calls.append({
             "username": username,
             "quantity": quantity,
