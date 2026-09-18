@@ -77,6 +77,7 @@ class GameauClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "AutoStars/2.4",
         }
         self.max_retries = max(1, int(max_retries))
         self.timeout = timeout

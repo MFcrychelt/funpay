@@ -57,8 +57,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -1608,6 +1610,20 @@ def _parse_calc_args(raw: list[str]) -> tuple[float, int, float | None]:
 
 def main(argv: list[str] | None = None) -> None:
     """Точка входа CLI (без SystemExit — удобно вызывать из GUI и тестов)."""
+    # На Windows: переключаем stdout/stderr на UTF-8 чтобы emoji и кириллица не падали
+    if os.name == "nt":
+        import io
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        else:
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+
     args = build_parser().parse_args(argv)
     # сообщение о создании печатаем сами (ниже) — с пояснением про локальные команды
     created = ensure_env_file(quiet=True)

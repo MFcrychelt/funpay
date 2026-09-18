@@ -75,7 +75,7 @@ def engine_command(*args: str) -> list[str]:
             if candidate and candidate.exists():
                 return [str(candidate), *args]
         return [str(exe), *args]
-    return [sys.executable, "-m", "autostars.main", *args]
+    return [sys.executable, "-u", "-m", "autostars.main", *args]
 
 
 def _popen_kwargs() -> dict[str, Any]:
