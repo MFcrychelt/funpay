@@ -189,7 +189,10 @@ class AutoStarsGUI:
         try:
             req = urllib.request.Request(
                 f"{base_url}/account",
-                headers={"Authorization": f"Bearer {api_key}"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "AutoStars/2.0",
+                },
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read().decode())
