@@ -153,7 +153,7 @@ class AutoStarsGUI:
             self.status_text.color = ft.Colors.RED_400
         self._add_log("⏹ Бот остановлен", "warning")
 
-    async def _check_connection(self, e):
+    def _check_connection(self, e):
         """Проверка подключения к GAMEAU."""
         cfg = read_config()
         api_key = cfg.get("API", {}).get("token", "")
@@ -162,18 +162,30 @@ class AutoStarsGUI:
             self._add_log("❌ API токен не задан", "error")
             return
 
-        client = GameauClient(api_key=api_key, base_url=base_url)
-        ok = await client.ping()
-        if ok:
-            self._add_log("✅ GAMEAU API доступен", "success")
-        else:
-            self._add_log("❌ GAMEAU API недоступен", "error")
+        import urllib.request
+        import json as _json
+        try:
+            req = urllib.request.Request(
+                f"{base_url}/ping",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    self._add_log("✅ GAMEAU API доступен", "success")
+                else:
+                    self._add_log(f"❌ GAMEAU ответил: {resp.status}", "error")
+        except Exception as ex:
+            self._add_log(f"❌ GAMEAU недоступен: {ex}", "error")
 
     def _save_settings(self, e, fields: dict):
         """Сохранение настроек из полей ввода."""
         cfg = read_config()
         for key, field in fields.items():
-            val = field.value.strip()
+            # Switch — булево значение
+            if isinstance(field, ft.Switch):
+                cfg.setdefault("FINANCE", {})[key] = field.value
+                continue
+            val = field.value.strip() if isinstance(field.value, str) else str(field.value)
             if not val:
                 continue
             # Определяем тип
