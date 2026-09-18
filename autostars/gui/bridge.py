@@ -86,6 +86,7 @@ def _popen_kwargs() -> dict[str, Any]:
     На Windows дополнительно подавляем консольное окно.
     """
     env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
     cwd = app_dir()
     if not is_frozen():
         existing = env.get("PYTHONPATH", "")
