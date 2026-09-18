@@ -8,7 +8,6 @@
 """
 
 import flet as ft
-from flet.app import run as flet_run
 import json
 import asyncio
 import threading
@@ -273,7 +272,7 @@ class AutoStarsGUI:
             title=ft.Text("🧮 Калькулятор прибыли"),
             content=ft.Column([
                 stars_field,
-                ft.Button("Рассчитать", on_click=calc),
+                ft.ElevatedButton("Рассчитать", on_click=calc),
                 result_text,
             ]),
             actions=[ft.TextButton("Закрыть", on_click=lambda e: page.close(dlg))],
@@ -305,7 +304,7 @@ class AutoStarsGUI:
                 ]),
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             bgcolor=ft.Colors.GREY_900,
-            padding=ft.Padding(left=20, top=12, right=20, bottom=12),
+            padding=ft.padding.symmetric(horizontal=20, vertical=12),
         )
 
         # ═══════════════════ ВКЛАДКИ ═══════════════════ #
@@ -338,28 +337,28 @@ class AutoStarsGUI:
                             ft.Text("Управление ботом", size=18, weight=ft.FontWeight.BOLD,
                                     color=ft.Colors.WHITE),
                             ft.Row([
-                                ft.Button(
+                                ft.ElevatedButton(
                                     "▶ Запустить",
                                     on_click=self._start_bot,
                                     bgcolor=ft.Colors.GREEN_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.PLAY_ARROW,
                                 ),
-                                ft.Button(
+                                ft.ElevatedButton(
                                     "⏹ Остановить",
                                     on_click=self._stop_bot,
                                     bgcolor=ft.Colors.RED_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.STOP,
                                 ),
-                                ft.Button(
+                                ft.ElevatedButton(
                                     "🔍 Проверить API",
                                     on_click=self._check_connection,
                                     bgcolor=ft.Colors.BLUE_800,
                                     color=ft.Colors.WHITE,
                                     icon=ft.Icons.WIFI_FIND,
                                 ),
-                                ft.Button(
+                                ft.ElevatedButton(
                                     "🧮 Калькулятор",
                                     on_click=lambda e: self._calc_profit_dialog(e, page),
                                     bgcolor=ft.Colors.PURPLE_800,
@@ -441,7 +440,7 @@ class AutoStarsGUI:
                     ft.Divider(color=ft.Colors.GREY_800),
 
                     # Кнопка сохранения
-                    ft.Button(
+                    ft.ElevatedButton(
                         "💾 Сохранить настройки",
                         on_click=lambda e: self._save_settings(e, fields),
                         bgcolor=ft.Colors.CYAN_800,
@@ -463,7 +462,7 @@ class AutoStarsGUI:
             content=ft.Container(
                 content=ft.Column([
                     ft.Row([
-                        ft.Button(
+                        ft.ElevatedButton(
                             "🔄 Обновить",
                             on_click=self._refresh_stats,
                             bgcolor=ft.Colors.BLUE_800,
@@ -489,7 +488,7 @@ class AutoStarsGUI:
             text="📝 Логи",
             content=ft.Container(
                 content=ft.Column([
-                    ft.Button(
+                    ft.ElevatedButton(
                         "🗑 Очистить",
                         on_click=lambda e: setattr(self.log_list, "controls", []) or e.page.update(),
                         bgcolor=ft.Colors.GREY_800,
@@ -511,7 +510,7 @@ class AutoStarsGUI:
 
 def main():
     def run_flet():
-        flet_run(AutoStarsGUI().build)
+        ft.app(target=AutoStarsGUI().build)
 
     run_flet()
 
