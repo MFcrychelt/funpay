@@ -155,7 +155,7 @@ def check_cli() -> None:
             text=True,
             timeout=60,
             cwd=str(ROOT),
-            env={**os.environ},
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         if proc.returncode == 0:
             report(OK, "python -m autostars.main --help")

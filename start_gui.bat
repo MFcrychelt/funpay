@@ -16,6 +16,7 @@ if exist ".venv\Scripts\activate.bat" (
     echo        или: python -m pip install -e ".[gui]"
 )
 
+set PYTHONIOENCODING=utf-8
 python autostars_gui.py
 if errorlevel 1 (
     echo.

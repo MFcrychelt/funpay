@@ -16,5 +16,6 @@ if exist ".venv\Scripts\activate.bat" (
     call ".venv\Scripts\activate.bat"
 )
 
+set PYTHONIOENCODING=utf-8
 python autostars_bot.py %*
 if errorlevel 1 pause
