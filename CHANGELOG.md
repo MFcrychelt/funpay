@@ -42,7 +42,8 @@
   `build.bat` (UTF-8 + CRLF, `chcp 65001`), профиль `autostars.spec`, `ico.ico`.
 - **Docker/systemd**: `Dockerfile` (non-root, healthcheck `--check`),
   `docker-compose.yml` (`./data`, `stop_grace_period`), `deploy/autostars.service`.
-- **CI** (`.github/workflows/ci.yml`): ruff + `compileall` + pytest на 3.10/3.11/3.12,
+- **CI** (`ci/github-ci.yml`, включается копированием в `.github/workflows/ci.yml`):
+  ruff + `compileall` + pytest на 3.10/3.11/3.12,
   смоук CLI, GUI-смоук (`tools/gui_smoke.py`), legacy-тесты (не блокирующие),
   `docker build`.
 - **Тесты**: `tests/conftest.py` (`isolated_env` — ни один тест не трогает рабочие

@@ -16,8 +16,10 @@ python -m ruff check autostars tests tools check_env.py
 python -m compileall -q autostars    # синтаксис под целевую версию Python
 ```
 
-Всё это делает CI (`.github/workflows/ci.yml`) на Python 3.10/3.11/3.12 — локальный
-прогон должен давать тот же результат.
+Всё это делает CI ([`ci/github-ci.yml`](../ci/github-ci.yml)) на Python 3.10/3.11/3.12 —
+локальный прогон должен давать тот же результат. Сам workflow не включён в
+`.github/workflows/` (правка таких файлов требует отдельного права GitHub) —
+включается одной командой, см. [ci/README.md](../ci/README.md).
 
 ## 2. Карта тестов
 

@@ -164,8 +164,9 @@ RECEIVED → PARSED_OK/PARSED_FAIL → PACKAGE_SELECTED → GAMEAU_CREATED
   healthcheck `--check`, graceful stop 60 с;
 - `deploy/autostars.service` — systemd с `EnvironmentFile`, `Restart=always`,
   `TimeoutStopSec=90`, `ProtectSystem=full`;
-- CI `.github/workflows/ci.yml` — ruff, 3.10/3.11/3.12, смоук CLI, GUI-смоук,
-  legacy-тесты, `docker build`.
+- CI [`ci/github-ci.yml`](ci/github-ci.yml) — ruff, 3.10/3.11/3.12, смоук CLI, GUI-смоук,
+  legacy-тесты, проверка ссылок документации, `docker build`; включается копированием в
+  `.github/workflows/ci.yml` ([ci/README.md](ci/README.md)).
 
 ## 11. Чего здесь сознательно нет
 

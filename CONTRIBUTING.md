@@ -27,7 +27,9 @@ python tools/gui_smoke.py                 # интерфейс собирает�
 python -m compileall -q autostars         # синтаксис на целевой версии Python
 ```
 
-Перечисленное — ровно то, что делает CI; локальные прогоны должны совпадать с ним.
+Перечисленное — ровно то, что делает CI ([`ci/github-ci.yml`](ci/github-ci.yml),
+включается копированием в `.github/workflows/ci.yml` — [ci/README.md](ci/README.md));
+локальные прогоны должны совпадать с ним.
 Форматирование импортов/лишние `noqa` правит `python -m ruff check --fix`.
 
 ## 3. Карта репозитория

@@ -26,6 +26,7 @@ def md_files() -> list[Path]:
     files += sorted(p for p in ROOT.glob("*.md"))
     files += sorted((ROOT / "legacy").glob("*.md"))
     files += sorted((ROOT / "docs").glob("*.md"))
+    files += sorted((ROOT / "ci").glob("*.md"))
     return [p for p in dict.fromkeys(files) if p.exists()]
 
 

@@ -75,7 +75,7 @@ Dockerfile · docker-compose.yml · deploy/autostars.service
 tests/                        # pytest движка, CLI, моста GUI и настроек
 tools/gui_smoke.py            # headless-проверка, что интерфейс собирается
 legacy/                       # исходный AutoStars-New: main.py, bot/, gui.py, свои тесты
-.github/workflows/ci.yml      # CI: линтер, тесты, смоук CLI, GUI-смоук, docker build
+ci/github-ci.yml              # CI (копируется в .github/workflows/ci.yml — см. ci/README.md)
 docs/                         # ARCHITECTURE · SECURITY · TESTING · WINDOWS_BUILD · REFERENCES
 ```
 
@@ -232,8 +232,9 @@ python tools/gui_smoke.py                 # собирается ли интер
 python -m ruff check autostars tests      # линтер (конфиг в pyproject.toml)
 ```
 
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) прогоняет это на
-Python 3.10/3.11/3.12, отдельно — GUI-смоук, legacy и `docker build`.
+CI ([ci/github-ci.yml](ci/github-ci.yml)) прогоняет это на Python 3.10/3.11/3.12,
+отдельно — GUI-смоук, legacy, проверка ссылок в документации и `docker build`. Файл
+нужно один раз скопировать в `.github/workflows/ci.yml` — [как и почему](ci/README.md).
 Подробности — [docs/TESTING.md](docs/TESTING.md).
 
 ## 🔒 Безопасность и риски
@@ -259,6 +260,7 @@ Telegram), в `--config-show` выводятся только замаскиро
 | [docs/TESTING.md](docs/TESTING.md) | как запускать тесты, карта тестов, правила (без сети, без денег) |
 | [docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md) | `install.bat`, `build.bat`, `.exe`, автозапуск, антивирусы |
 | [docs/REFERENCES.md](docs/REFERENCES.md) | референс-проект, версии зависимостей, используемые концы API |
+| [ci/README.md](ci/README.md) | что проверяет CI и как включить workflow одним копированием |
 | [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) | история версий; как вносить изменения |
 | [legacy/README.md](legacy/README.md) | почему старый код изолирован и как перенести `db.json` |
 
