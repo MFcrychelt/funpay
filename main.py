@@ -53,18 +53,22 @@ class GameauClient:
         """Детерминированный UUID v5 на основе ID заказа FunPay."""
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"funpay_{order_id}"))
 
-    async def ping(self) -> bool:
-        """Проверка доступности API."""
+    async def ping(self) -> dict:
+        """Проверка доступности API и данных аккаунта."""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{self.base_url}/ping",
+                    f"{self.base_url}/account",
                     headers=self.headers,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
-                    return resp.status == 200
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            return {"ok": True, "account": data.get("account", {})}
+                    return {"ok": False}
         except Exception:
-            return False
+            return {"ok": False}
 
     async def get_catalog(self) -> list:
         """Получение каталога товаров."""

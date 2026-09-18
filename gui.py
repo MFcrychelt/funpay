@@ -185,18 +185,22 @@ class AutoStarsGUI:
             except: pass
 
         import urllib.request
+        import json as _json
         try:
             req = urllib.request.Request(
-                f"{base_url}/ping",
+                f"{base_url}/account",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    msg = "✅ GAMEAU API доступен"
+                data = _json.loads(resp.read().decode())
+                if resp.status == 200 and data.get("ok"):
+                    acc = data.get("account", {})
+                    msg = (f"✅ GAMEAU подключён | @{acc.get('username','')} | "
+                           f"Баланс: ${acc.get('balance',0):.2f} | {acc.get('plan','')}")
                     self._add_log(msg, "success")
                     color = ft.Colors.GREEN_400
                 else:
-                    msg = f"❌ GAMEAU ответил: {resp.status}"
+                    msg = f"❌ GAMEAU: {data.get('error', 'неизвестная ошибка')}"
                     self._add_log(msg, "error")
                     color = ft.Colors.RED_400
         except Exception as ex:
