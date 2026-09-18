@@ -76,6 +76,26 @@ class Config:
     db_path: str = "autostars.db"
     poll_interval: float = 5.0
     log_file: str = "autostars.log"
+    log_max_bytes: int = 5_000_000   # размер лог-файла до ротации
+    log_backup_count: int = 5        # количество ротируемых лог-файлов
+
+    # --- Трекинг выполнения задач ---
+    stuck_task_minutes: int = 20         # задача считается "зависшей" после N минут без движения
+    reconciliation_interval_sec: int = 60  # как часто согласовывать незавершённые задачи с GAMEAU
+    max_order_retries: int = 2           # повторы запроса GAMEAU при сетевых сбоях
+    wait_completion_timeout: float = 120.0  # сколько ждать финальный статус заказа GAMEAU
+
+    # --- Периодическая отправка статистики в Telegram ---
+    # 0 = выключено; N = отправлять сводку (1ч/24ч/сегодня) каждые N минут
+    stats_push_interval_min: int = 0
+
+    # --- Отзывчивость и устойчивость (v2.2) ---
+    # Как часто опрашивать чаты заказов, ожидающих @username (секунды)
+    chat_monitor_interval_sec: int = 15
+    # Алерт, если баланс GAMEAU ниже порога (USDT)
+    low_balance_threshold_usdt: float = 50.0
+    # Как часто проверять баланс GAMEAU (минуты)
+    balance_check_interval_min: int = 10
 
     # --- Дополнительные правила для лотов ---
     lot_rules: list[dict[str, Any]] = field(default_factory=list)
@@ -133,6 +153,17 @@ class Config:
             "DEFAULT_STARS_QUANTITY": "default_stars_quantity",
             "POLL_INTERVAL": "poll_interval",
             "FUNPAY_USER_AGENT": "funpay_user_agent",
+            "LOG_FILE": "log_file",
+            "LOG_MAX_BYTES": "log_max_bytes",
+            "LOG_BACKUP_COUNT": "log_backup_count",
+            "STUCK_TASK_MINUTES": "stuck_task_minutes",
+            "RECONCILIATION_INTERVAL_SEC": "reconciliation_interval_sec",
+            "MAX_ORDER_RETRIES": "max_order_retries",
+            "WAIT_COMPLETION_TIMEOUT": "wait_completion_timeout",
+            "STATS_PUSH_INTERVAL_MIN": "stats_push_interval_min",
+            "CHAT_MONITOR_INTERVAL_SEC": "chat_monitor_interval_sec",
+            "LOW_BALANCE_THRESHOLD_USDT": "low_balance_threshold_usdt",
+            "BALANCE_CHECK_INTERVAL_MIN": "balance_check_interval_min",
         }
 
         for env_var, attr in env_map.items():

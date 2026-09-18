@@ -31,6 +31,18 @@ class TelegramNotifier:
         self.active_variant = active_variant
         self.tron_energy_fee_rub = float(tron_energy_fee_rub)
         self.timeout = timeout
+        # Персистентный HTTP-клиент (пул соединений) — алерты уходят быстрее
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     @property
     def is_configured(self) -> bool:
@@ -95,16 +107,41 @@ class TelegramNotifier:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, json=payload)
-                if response.status_code == 200:
-                    logger.debug("Telegram alert успешно доставлен")
-                    return True
-                logger.error(f"Ошибка Telegram API: {response.status_code} - {response.text}")
-                return False
+            client = await self._http()
+            response = await client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.debug("Telegram alert успешно доставлен")
+                return True
+            logger.error(f"Ошибка Telegram API: {response.status_code} - {response.text}")
+            return False
         except Exception as exc:
             logger.error(f"Не удалось отправить уведомление в Telegram: {exc}")
             return False
+
+    async def send_stats_report(self, text: str, parse_mode: str = "HTML") -> bool:
+        """
+        Отправляет развёрнутый статистический отчёт (1ч/2ч/3ч/4ч/6ч/день).
+        Делит длинный текст на части (лимит Telegram — 4096 символов).
+        """
+        if not text.strip():
+            return True
+        chunks: list[str] = []
+        current = ""
+        for line in text.splitlines():
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > 4000 and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        ok = True
+        for i, chunk in enumerate(chunks, 1):
+            suffix = f"\n\n— часть {i}/{len(chunks)}" if len(chunks) > 1 else ""
+            ok = await self.send_alert(chunk + suffix, parse_mode=parse_mode) and ok
+        return ok
 
     async def alert_order_completed(
         self,

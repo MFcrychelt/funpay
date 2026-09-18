@@ -2,117 +2,113 @@
 
 ## Системные требования
 
-- Windows 10/11
-- Python 3.8 или выше
-- Интернет соединение
+- Linux / Windows 10-11 / macOS
+- Python 3.10 или выше
+- Интернет-соединение
+- Аккаунты: FunPay (продавец, golden key), gameau.us (API-ключ),
+  Telegram-бот для уведомлений (опционально)
 
-## Пошаговая установка
-
-### 1. Установка Python
-
-Скачайте и установите Python с официального сайта: https://python.org/downloads/
-
-**Важно:** При установке обязательно поставьте галочку "Add Python to PATH"
-
-### 2. Скачивание проекта
+## Установка
 
 ```bash
-git clone https://github.com/yourusername/AutoStars.git
-cd AutoStars
-```
+git clone <ваш-репозиторий> && cd funpay
 
-Или скачайте ZIP архив и распакуйте его.
+python -m venv .venv
+# Linux/macOS:
+. .venv/bin/activate
+# Windows:
+# .venv\Scripts\activate
 
-### 3. Установка зависимостей
-
-Откройте командную строку в папке проекта и выполните:
-
-```bash
 pip install -r requirements.txt
+
+cp .env.example .env
+nano .env   # заполнить FUNPAY_GOLDEN_KEY, GAMEAU_API_KEY, TELEGRAM_*
 ```
 
-### 4. Настройка конфигурации
+### Где взять ключи
 
-1. Скопируйте файл `config.example.json` в `config.json`
-2. Откройте `config.json` в текстовом редакторе
-3. Заполните необходимые поля:
+**FUNPAY_GOLDEN_KEY**
+1. Войдите в аккаунт FunPay → на любой странице откройте DevTools (F12)
+2. Network → Cookies → `golden_key`
+3. Вставьте в `.env`
 
-```json
-{
-  "API": {
-    "token": "ВАШ_API_ТОКЕН"
-  },
-  "BOT": {
-    "enabled": 1,
-    "bot_token": "ВАШ_BOT_ТОКЕН"
-  },
-  "FUNPAY": {
-    "golden_key": "ВАШ_GOLDEN_KEY"
-  }
-}
-```
+**GAMEAU_API_KEY**
+1. gameau.us → Профиль → «API для интеграций» → «Выпустить ключ»
+2. Ключ показывается один раз — скопируйте сразу
 
-### 5. Получение токенов
+**TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID**
+1. @BotFather → /newbot → токен
+2. Напишите боту сообщение; chat_id получите через @userinfobot
+   (или `https://api.telegram.org/bot<TOKEN>/getUpdates`)
 
-#### API Token
-1. Напишите боту @FraglyRoBot в Telegram
-2. Получите API токен для выдачи звёзд
+## Проверка и запуск
 
-#### Bot Token
-1. Напишите боту @BotFather в Telegram
-2. Создайте нового бота командой `/newbot`
-3. Скопируйте полученный токен
-
-#### Golden Key
-1. Войдите в свой аккаунт FunPay
-2. Получите Golden Key через настройки аккаунта
-
-### 6. Запуск
-
-#### Консольная версия:
 ```bash
-python main.py
+# Диагностика всех модулей (FunPay, GAMEAU, БД, Telegram, курсы)
+python -m autostars.main --check
+
+# Каталог GAMEAU с себестоимостью по обоим вариантам курса
+python -m autostars.main --catalog
+
+# Тестовый заказ (50 звёзд на ваш аккаунт)
+python -m autostars.main --test-order your_username
+
+# Основной цикл автовыдачи
+python -m autostars.main
 ```
 
-#### GUI версия:
+## Отчёты и трекер задач
+
 ```bash
-python gui.py
+python -m autostars.main --stats            # 1/2/3/4/6/24ч, день, всего
+python -m autostars.main --report           # P&L + убытки + топ + провалы
+python -m autostars.main --tasks            # открытые/зависшие задачи + журнал
+python -m autostars.main --timeline 123456  # жизненный цикл одной задачи
+python -m autostars.main --stats-push       # статистика в Telegram
 ```
 
-Или просто запустите файл `start_gui.bat`
+## Docker
+
+```bash
+cp .env.example .env && nano .env
+docker compose up -d --build
+docker compose logs -f
+```
+
+База (`autostars.db`) и логи сохраняются в `./data/` на хосте.
+
+## Автозапуск (systemd, Linux)
+
+Готовый юнит — [`deploy/autostars.service`](deploy/autostars.service):
+
+```bash
+# 1. Проект в /opt/funpay, venv и зависимости установлены, .env заполнен
+# 2. Установка и запуск
+sudo cp deploy/autostars.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now autostars
+
+# 3. Логи
+journalctl -u autostars -f
+```
+
+Пауза/возобновление — без остановки сервиса:
+`python -m autostars.main --pause` / `--resume` (или TG `/pause` `/resume`);
+флаг переживает перезапуск.
 
 ## Возможные проблемы
 
-### Ошибка "python не найден"
-- Переустановите Python с галочкой "Add to PATH"
-- Или используйте `py` вместо `python`
+| Симптом | Решение |
+|---|---|
+| `[ERR] FunPay: ...` в `--check` | неверный `FUNPAY_GOLDEN_KEY`, сессия «offline» в FunPay |
+| `401` от GAMEAU | ключ отозван — выпустите новый |
+| `LOW_BALANCE` | пополните USDT TRC-20 (инструкция: `--deposit-info`) |
+| `PRICE_EXCEEDED` | цена пакета выше `DEFAULT_MAX_CHARGE_USDT` — увеличьте лимит |
+| Заказ завис в PROCESSING | бот сам досинхронизирует через reconcile; `--timeline ID` — детали |
 
-### Ошибка установки зависимостей
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt --user
-```
+## Legacy-компоненты
 
-### Ошибка "config.json не найден"
-- Убедитесь, что файл `config.json` находится в той же папке, что и `main.py`
-- Проверьте правильность JSON синтаксиса
-
-### Проблемы с FunPay API
-- Убедитесь, что Golden Key действителен
-- Проверьте статус "online" на FunPay
-- Убедитесь в правильности категории товара
-
-## Поддержка
-
-При возникновении проблем:
-1. Проверьте логи в консоли
-2. Убедитесь в правильности конфигурации
-3. Проверьте подключение к интернету
-4. Обратитесь к разработчику
-
-## Автозапуск (опционально)
-
-Для автоматического запуска при включении компьютера:
-1. Нажмите Win+R, введите `shell:startup`
-2. Скопируйте туда файл `start_gui.bat`
-3. Создайте ярлык для удобства
+Исходный релиз AutoStars-New сохранён как отдельный стек:
+`python main.py` (консоль, FunPayAPI + db.json), `python gui.py` (Flet-GUI),
+пакет `bot/`. Для боевой автовыдачи используйте движок `autostars/`
+(`python -m autostars.main`).

@@ -36,6 +36,21 @@ class GameauClient:
         self.max_retries = max_retries
         self.timeout = timeout
         self._catalog_cache: Optional[tuple[float, list[dict[str, Any]]]] = None
+        # Персистентный клиент: переиспользование соединений (без TLS-хендшейка
+        # на каждый запрос) — быстрее реагирование на новые заказы.
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _http(self) -> httpx.AsyncClient:
+        """Лениво создаёт и переиспользует httpx.AsyncClient с пулом соединений."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def close(self) -> None:
+        """Закрывает соединение (вызывается при остановке бота)."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     def _get_idempotency_key(self, order_id: str) -> str:
         """Генерирует детерминированный UUID v5 для заказа FunPay."""
@@ -60,32 +75,32 @@ class GameauClient:
         url = f"{self.base_url}/catalog"
         params = {"type": item_type, "limit": limit}
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(url, params=params, headers=self.headers)
-                if response.status_code == 404 and "/v1" in self.base_url:
-                    # Попытка фоллбэка без /v1
-                    fallback_url = self.base_url.replace("/v1", "") + "/catalog"
-                    response = await client.get(fallback_url, params=params, headers=self.headers)
+        client = await self._http()
+        try:
+            response = await client.get(url, params=params, headers=self.headers)
+            if response.status_code == 404 and "/v1" in self.base_url:
+                # Попытка фоллбэка без /v1
+                fallback_url = self.base_url.replace("/v1", "") + "/catalog"
+                response = await client.get(fallback_url, params=params, headers=self.headers)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    items = []
-                    if isinstance(data, list):
-                        items = data
-                    elif isinstance(data, dict):
-                        cat = data.get("catalog") or {}
-                        items = cat.get("items") or data.get("items") or []
+            if response.status_code == 200:
+                data = response.json()
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    cat = data.get("catalog") or {}
+                    items = cat.get("items") or data.get("items") or []
 
-                    self._catalog_cache = (now, items)
-                    logger.debug(f"Загружен каталог Gameau: {len(items)} позиций типа {item_type}")
-                    return items
-                else:
-                    logger.warning(f"Ошибка загрузки каталога Gameau: {response.status_code} - {response.text}")
-                    return []
-            except Exception as exc:
-                logger.error(f"Сетевой сбой при запросе каталога: {exc}")
+                self._catalog_cache = (now, items)
+                logger.debug(f"Загружен каталог Gameau: {len(items)} позиций типа {item_type}")
+                return items
+            else:
+                logger.warning(f"Ошибка загрузки каталога Gameau: {response.status_code} - {response.text}")
                 return []
+        except Exception as exc:
+            logger.error(f"Сетевой сбой при запросе каталога: {exc}")
+            return []
 
     @staticmethod
     def extract_item_stars(item: Dict[str, Any]) -> Optional[int]:
@@ -177,85 +192,85 @@ class GameauClient:
             order_urls.append(f"{self.base_url}/v1/orders/telegramStars")
 
         last_error = "NETWORK_TIMEOUT"
+        client = await self._http()
 
         for attempt in range(self.max_retries):
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                for url in order_urls:
-                    try:
-                        response = await client.post(
-                            url,
-                            json=payload,
-                            headers=request_headers,
+            for url in order_urls:
+                try:
+                    response = await client.post(
+                        url,
+                        json=payload,
+                        headers=request_headers,
+                    )
+
+                    if response.status_code == 404:
+                        # Пробуем следующий альтернативный URL
+                        continue
+
+                    # Успешный ответ
+                    if response.status_code in (200, 201):
+                        data = response.json()
+                        order_obj = data.get("order") or data
+                        created_order_id = str(order_obj.get("id") or order_obj.get("orderId") or "")
+                        logger.info(
+                            f"[ORDER {order_id}] Успешно создан заказ в Gameau: {created_order_id} "
+                            f"({quantity} Stars для @{clean_username})"
                         )
 
-                        if response.status_code == 404:
-                            # Пробуем следующий альтернативный URL
-                            continue
-
-                        # Успешный ответ
-                        if response.status_code in (200, 201):
-                            data = response.json()
-                            order_obj = data.get("order") or data
-                            created_order_id = str(order_obj.get("id") or order_obj.get("orderId") or "")
-                            logger.info(
-                                f"[ORDER {order_id}] Успешно создан заказ в Gameau: {created_order_id} "
-                                f"({quantity} Stars для @{clean_username})"
-                            )
-
-                            if wait_completion and created_order_id:
-                                final_order = await self.wait_for_completion(created_order_id)
-                                return {
-                                    "success": True,
-                                    "data": final_order,
-                                    "idempotency_key": idempotency_key,
-                                }
-
+                        if wait_completion and created_order_id:
+                            final_order = await self.wait_for_completion(created_order_id)
                             return {
                                 "success": True,
-                                "data": order_obj,
+                                "data": final_order,
                                 "idempotency_key": idempotency_key,
                             }
 
-                        # Превышение maxCharge или смена цены
-                        elif response.status_code in (400, 409) and (
-                            "maxCharge" in response.text
-                            or "PRICE_CHANGED" in response.text
-                            or "price" in response.text.lower()
-                        ):
-                            logger.error(f"[ORDER {order_id}] Превышен лимит стоимости maxCharge!")
-                            return {"success": False, "error": "PRICE_EXCEEDED"}
+                        return {
+                            "success": True,
+                            "data": order_obj,
+                            "idempotency_key": idempotency_key,
+                        }
 
-                        # Недостаточно средств
-                        elif response.status_code == 402 or (
-                            response.status_code == 400 and "INSUFFICIENT_BALANCE" in response.text
-                        ):
-                            logger.critical(f"[ORDER {order_id}] Недостаточно USDT на балансе Gameau!")
-                            return {"success": False, "error": "LOW_BALANCE"}
+                    # Превышение maxCharge или смена цены
+                    elif response.status_code in (400, 409) and (
+                        "maxCharge" in response.text
+                        or "PRICE_CHANGED" in response.text
+                        or "price" in response.text.lower()
+                    ):
+                        logger.error(f"[ORDER {order_id}] Превышен лимит стоимости maxCharge!")
+                        return {"success": False, "error": "PRICE_EXCEEDED"}
 
-                        # Временные ошибки (429 Too Many Requests, 502/503/504)
-                        elif response.status_code in (429, 502, 503, 504):
-                            logger.warning(
-                                f"[ORDER {order_id}] Временная ошибка Gameau ({response.status_code}). "
-                                f"Попытка {attempt + 1}/{self.max_retries}"
-                            )
-                            last_error = f"API_ERROR_{response.status_code}"
-                            break  # Переходим к следующему циклу retry с backoff
+                    # Недостаточно средств
+                    elif response.status_code == 402 or (
+                        response.status_code == 400 and "INSUFFICIENT_BALANCE" in response.text
+                    ):
+                        logger.critical(f"[ORDER {order_id}] Недостаточно USDT на балансе Gameau!")
+                        return {"success": False, "error": "LOW_BALANCE"}
 
-                        else:
-                            logger.error(
-                                f"[ORDER {order_id}] Ошибка API Gameau: {response.status_code} - {response.text}"
-                            )
-                            return {
-                                "success": False,
-                                "error": f"API_ERROR_{response.status_code}",
-                            }
-
-                    except httpx.RequestError as exc:
+                    # Временные ошибки (429 Too Many Requests, 502/503/504)
+                    elif response.status_code in (429, 502, 503, 504):
                         logger.warning(
-                            f"[ORDER {order_id}] Сетевой сбой Gameau ({url}): {exc}"
+                            f"[ORDER {order_id}] Временная ошибка Gameau ({response.status_code}). "
+                            f"Попытка {attempt + 1}/{self.max_retries}"
                         )
-                        last_error = "NETWORK_TIMEOUT"
-                        break
+                        last_error = f"API_ERROR_{response.status_code}"
+                        break  # Переходим к следующему циклу retry с backoff
+
+                    else:
+                        logger.error(
+                            f"[ORDER {order_id}] Ошибка API Gameau: {response.status_code} - {response.text}"
+                        )
+                        return {
+                            "success": False,
+                            "error": f"API_ERROR_{response.status_code}",
+                        }
+
+                except httpx.RequestError as exc:
+                    logger.warning(
+                        f"[ORDER {order_id}] Сетевой сбой Gameau ({url}): {exc}"
+                    )
+                    last_error = "NETWORK_TIMEOUT"
+                    break
 
             if attempt < self.max_retries - 1:
                 await asyncio.sleep(2**attempt)
@@ -268,15 +283,15 @@ class GameauClient:
             f"{self.base_url}/orders/status/{order_id}",
             f"{self.base_url}/status/{order_id}",
         ]
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for url in status_urls:
-                try:
-                    response = await client.get(url, headers=self.headers)
-                    if response.status_code == 200:
-                        data = response.json()
-                        return data.get("order") or data
-                except Exception as exc:
-                    logger.debug(f"Ошибка запроса статуса по {url}: {exc}")
+        client = await self._http()
+        for url in status_urls:
+            try:
+                response = await client.get(url, headers=self.headers)
+                if response.status_code == 200:
+                    data = response.json()
+                    return data.get("order") or data
+            except Exception as exc:
+                logger.debug(f"Ошибка запроса статуса по {url}: {exc}")
         return {"status": "unknown"}
 
     async def wait_for_completion(
@@ -313,15 +328,15 @@ class GameauClient:
 
     async def get_account(self) -> Dict[str, Any]:
         """Получает информацию об аккаунте Gameau (баланс USDT, статус)."""
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            try:
-                response = await client.get(
-                    f"{self.base_url}/account",
-                    headers=self.headers,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    return data.get("account") or data
-                return {"error": f"HTTP_{response.status_code}", "status_code": response.status_code}
-            except Exception as exc:
-                return {"error": str(exc)}
+        client = await self._http()
+        try:
+            response = await client.get(
+                f"{self.base_url}/account",
+                headers=self.headers,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("account") or data
+            return {"error": f"HTTP_{response.status_code}", "status_code": response.status_code}
+        except Exception as exc:
+            return {"error": str(exc)}

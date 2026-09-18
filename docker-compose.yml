@@ -4,11 +4,12 @@ services:
     container_name: funpay-stars-bot
     restart: unless-stopped
     environment:
-      FUNPAY_STARS_STATE: /app/data/state.json
+      DB_PATH: /app/data/autostars.db
+      LOG_FILE: /app/data/autostars.log
     volumes:
       # Секреты и настройки хоста пробрасываем в контейнер.
       - ./.env:/app/.env:ro
-      - ./config.json:/app/config.json:ro
-      # Состояние и логи сохраняем в каталог ./data на хосте.
+      # База данных (заказы, статистика, трекер задач) и логи сохраняем
+      # в каталог ./data на хосте — переживают пересборку контейнера.
       - ./data:/app/data
-    command: ["python", "main.py"]
+    command: ["python", "-m", "autostars.main"]
