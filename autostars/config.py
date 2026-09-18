@@ -89,6 +89,14 @@ class Config:
     # 0 = выключено; N = отправлять сводку (1ч/24ч/сегодня) каждые N минут
     stats_push_interval_min: int = 0
 
+    # --- Отзывчивость и устойчивость (v2.2) ---
+    # Как часто опрашивать чаты заказов, ожидающих @username (секунды)
+    chat_monitor_interval_sec: int = 15
+    # Алерт, если баланс GAMEAU ниже порога (USDT)
+    low_balance_threshold_usdt: float = 50.0
+    # Как часто проверять баланс GAMEAU (минуты)
+    balance_check_interval_min: int = 10
+
     # --- Дополнительные правила для лотов ---
     lot_rules: list[dict[str, Any]] = field(default_factory=list)
 
@@ -153,6 +161,9 @@ class Config:
             "MAX_ORDER_RETRIES": "max_order_retries",
             "WAIT_COMPLETION_TIMEOUT": "wait_completion_timeout",
             "STATS_PUSH_INTERVAL_MIN": "stats_push_interval_min",
+            "CHAT_MONITOR_INTERVAL_SEC": "chat_monitor_interval_sec",
+            "LOW_BALANCE_THRESHOLD_USDT": "low_balance_threshold_usdt",
+            "BALANCE_CHECK_INTERVAL_MIN": "balance_check_interval_min",
         }
 
         for env_var, attr in env_map.items():

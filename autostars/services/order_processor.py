@@ -96,6 +96,7 @@ async def process_paid_order(
     task_tracker: Optional[TaskTracker] = None,
     max_order_retries: int = 2,
     wait_completion_timeout: float = 120.0,
+    bypass_processed_check: bool = False,
 ) -> Dict[str, Any]:
     """
     Обрабатывает оплаченный заказ с FunPay.
@@ -118,8 +119,10 @@ async def process_paid_order(
     # 0. Заказ получен
     await tracker.log(order_id, EV_RECEIVED, f"price={order_data.get('price') or 0}₽")
 
-    # 1. Проверяем, не обрабатывался ли заказ ранее (защита локальной БД)
-    if await db.is_order_processed(order_id):
+    # 1. Проверяем, не обрабатывался ли заказ ранее (защита локальной БД).
+    # bypass_processed_check — для чат-мониторинга (WAITING_USERNAME) и ретраев:
+    # повторный вход в пайплайн по инициативе оператора/системы.
+    if not bypass_processed_check and await db.is_order_processed(order_id):
         logger.debug(f"[ORDER {order_id}] Заказ уже обработан или находится в обработке. Пропуск.")
         return {"status": "already_processed", "order_id": order_id}
 

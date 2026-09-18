@@ -150,3 +150,35 @@
 ### 📝 Логирование
 - Консоль + ротируемый файл: `LOG_FILE`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT`
 - События задач дублируются в журнал `task_events` (поиск по ID заказа)
+
+## Отзывчивость и полнота управления (v2.2)
+
+### ⚡ Отзывчивость
+- Персистентные HTTP-соединения: GAMEAU- и Telegram-клиенты используют общий
+  `httpx.AsyncClient` (пул) — без TLS-хендшейка на каждый запрос
+- Long polling: FunPay `runner/` + Telegram `getUpdates` (timeout 50 c)
+- Параллельная обработка заказов (отдельные asyncio-задачи)
+- Каталог GAMEAU кешируется на 60 c
+
+### 💬 Чат-мониторинг WAITING_USERNAME
+- Если покупатель не указал @username — бот просит один раз (без спама)
+- Каждые `CHAT_MONITOR_INTERVAL_SEC` (15 c) читается последнее сообщение
+  покупателя в чате FunPay; найденный @username (и количество звёзд) →
+  авто-выдача. Событие CHAT_USERNAME_RECEIVED в журнале задачи
+
+### 📲 Управление с Telegram (long polling, только владелец)
+- `/help /status /stats /report /tasks /balance /pause /resume /retry <id> /calc <цена> [звёзды]`
+- Авторизация по chat_id из `.env`; чужие сообщения игнорируются
+
+### 🧯 Управление и устойчивость
+- Пауза/резюм: `--pause` / `--resume` / TG, флаг в БД (переживает рестарт);
+  в паузе новые заказы не принимаются, reconciliation и в-работе задачи
+  продолжают работать
+- Ретрай: `--retry-order ID` / TG `/retry ID` (идемпотентно, без дубля покупки)
+- Баланс GAMEAU: `--balance`, алерт при `LOW_BALANCE_THRESHOLD_USDT`,
+  проверка каждые `BALANCE_CHECK_INTERVAL_MIN` (и при старте)
+- Заказ с любой заведённой записью в БД не обрабатывается повторно
+  (включая FAILED — исключён цикл повторных ответов покупателю)
+
+### Автозапуск
+- systemd-юнит: `deploy/autostars.service`

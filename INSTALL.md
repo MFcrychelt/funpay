@@ -79,28 +79,22 @@ docker compose logs -f
 
 ## Автозапуск (systemd, Linux)
 
-`/etc/systemd/system/autostars.service`:
-
-```ini
-[Unit]
-Description=AutoStars - FunPay Stars delivery
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-WorkingDirectory=/opt/funpay
-ExecStart=/opt/funpay/.venv/bin/python -m autostars.main
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
+Готовый юнит — [`deploy/autostars.service`](deploy/autostars.service):
 
 ```bash
+# 1. Проект в /opt/funpay, venv и зависимости установлены, .env заполнен
+# 2. Установка и запуск
+sudo cp deploy/autostars.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable --now autostars
+
+# 3. Логи
 journalctl -u autostars -f
 ```
+
+Пауза/возобновление — без остановки сервиса:
+`python -m autostars.main --pause` / `--resume` (или TG `/pause` `/resume`);
+флаг переживает перезапуск.
 
 ## Возможные проблемы
 

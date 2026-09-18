@@ -31,6 +31,8 @@ TERMINAL_FAIL_STATUSES = (
     "FAILED_DELIVERY",
     "CANCELLED",
 )
+# Статусы, при которых допустим ручной ретрай заказа
+RETRYABLE_STATUSES = TERMINAL_FAIL_STATUSES
 
 
 class DBManager:
@@ -75,18 +77,19 @@ class DBManager:
 
     async def is_order_processed(self, order_id: str) -> bool:
         """
-        Проверяет, обрабатывался ли заказ ранее.
-        Возвращает True, если заказ имеет статус COMPLETED или PROCESSING.
+        Знает ли система об этом заказе (есть ли запись в БД).
+
+        Любая запись = заказ уже заведён в пайплайн: COMPLETED/PROCESSING —
+        в работе или закрыт, WAITING_USERNAME — ждём ник от покупателя
+        (подхватит чат-мониторинг, не спамим запрос заново), FAILED* — закрыт
+        с ошибкой (повтор только через --retry-order / TG /retry).
+        Это исключает повторную обработку и двойные ответы покупателю.
         """
         conn = await self.get_connection()
         async with conn.execute(
-            "SELECT status FROM orders WHERE order_id = ?", (str(order_id),)
+            "SELECT 1 FROM orders WHERE order_id = ? LIMIT 1", (str(order_id),)
         ) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                return False
-            status = row["status"]
-            return status in ("COMPLETED", "PROCESSING")
+            return await cursor.fetchone() is not None
 
     async def get_order(self, order_id: str) -> Optional[dict[str, Any]]:
         """Получает запись заказа по order_id."""

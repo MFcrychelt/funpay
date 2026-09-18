@@ -31,6 +31,18 @@ class TelegramNotifier:
         self.active_variant = active_variant
         self.tron_energy_fee_rub = float(tron_energy_fee_rub)
         self.timeout = timeout
+        # Персистентный HTTP-клиент (пул соединений) — алерты уходят быстрее
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
     @property
     def is_configured(self) -> bool:
@@ -95,13 +107,13 @@ class TelegramNotifier:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(url, json=payload)
-                if response.status_code == 200:
-                    logger.debug("Telegram alert успешно доставлен")
-                    return True
-                logger.error(f"Ошибка Telegram API: {response.status_code} - {response.text}")
-                return False
+            client = await self._http()
+            response = await client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.debug("Telegram alert успешно доставлен")
+                return True
+            logger.error(f"Ошибка Telegram API: {response.status_code} - {response.text}")
+            return False
         except Exception as exc:
             logger.error(f"Не удалось отправить уведомление в Telegram: {exc}")
             return False

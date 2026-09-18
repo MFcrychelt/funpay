@@ -13,6 +13,12 @@
     python -m autostars.main --tasks             # Трекинг выполнения задач (открытые/зависшие/журнал)
     python -m autostars.main --timeline 123456   # Полный жизненный цикл конкретной задачи
     python -m autostars.main --stats-push        # Отправить текущую статистику в Telegram
+    python -m autostars.main --balance           # Баланс GAMEAU и на сколько заказов его хватит
+    python -m autostars.main --pause / --resume  # Пауза/возобновление приёма новых заказов
+    python -m autostars.main --retry-order 123   # Повтор проваленного заказа (идемпотентно)
+
+В живом цикле дополнительно доступны TG-команды (/help):
+/stats /report /tasks /balance /pause /resume /retry <id> /calc <цена> [звёзды] /status
 """
 
 from __future__ import annotations
@@ -30,6 +36,8 @@ from .database.db_manager import DBManager
 from .clients.funpay import FunPayClient
 from .clients.gameau import GameauClient
 from .notifier.tg_alert import TelegramNotifier
+from .notifier.tg_commands import TelegramCommandServer, build_default_handlers
+from .services import bot_control
 from .services.order_processor import process_paid_order
 from .services.statistics import StatisticsService
 from .services.task_tracker import TaskTracker, reconcile_inflight_orders
@@ -163,6 +171,103 @@ async def cmd_timeline(cfg: Config, order_id: str) -> int:
         await db.close()
 
 
+async def cmd_balance(cfg: Config) -> int:
+    """Текущий баланс GAMEAU."""
+    gameau = GameauClient(api_key=cfg.gameau_key, base_url=cfg.gameau_base_url)
+    notifier = TelegramNotifier(
+        bot_token=cfg.telegram_bot_token,
+        chat_id=cfg.telegram_chat_id,
+        rate_variant_1=cfg.rate_variant_1,
+        rate_variant_2=cfg.rate_variant_2,
+        active_variant=cfg.exchange_variant,
+    )
+    try:
+        info = await bot_control.check_gameau_balance(
+            gameau, notifier, cfg.low_balance_threshold_usdt, alert=False
+        )
+        if info is None:
+            print("[ERR] Не удалось получить баланс GAMEAU (проверьте API-ключ и сеть).")
+            return 1
+        emoji = "🚨" if info["balance"] < cfg.low_balance_threshold_usdt else "💰"
+        print(f"{emoji} Баланс GAMEAU: {info['balance']:.2f} {info['currency']} "
+              f"(тариф {info['plan']}, статус {info['status']})")
+        print(f"   Порог алерта: {cfg.low_balance_threshold_usdt:.2f} {info['currency']}")
+        cost_1000 = 9.10 * cfg.active_usdt_rate
+        can_pay = int(info["balance"] // 9.10) if info["balance"] > 0 else 0
+        print(f"   Хватает на: ~{can_pay} заказ(ов) на 1000 Stars "
+              f"(9.10 USDT, себестоимость ~{cost_1000:.2f} ₽ по активному курсу)")
+        return 0
+    finally:
+        await gameau.close()
+        await notifier.close()
+
+
+async def cmd_pause(cfg: Config, pause: bool) -> int:
+    """Поставить/снять паузу приёма новых заказов (переживает рестарт)."""
+    db = DBManager(cfg.db_path)
+    await db.init_db()
+    try:
+        await bot_control.set_bot_paused(db, pause)
+        print("⏸ ПРИЁМ НОВЫХ ЗАКАЗОВ ОСТАНОВЛЕН. В работе — принятые заказы и reconciliation."
+              if pause else
+              "🟢 ВЫДАЧА ВОЗОБНОВЛЕНА. Новые заказы FunPay снова обрабатываются.")
+        return 0
+    finally:
+        await db.close()
+
+
+async def cmd_retry(cfg: Config, order_id: str) -> int:
+    """Повторить проваленный заказ (идемпотентно, по Idempotency-Key)."""
+    cfg.validate()
+    db = DBManager(cfg.db_path)
+    await db.init_db()
+
+    funpay = FunPayClient(golden_key=cfg.golden_key, user_agent=cfg.funpay_user_agent)
+    gameau = GameauClient(api_key=cfg.gameau_key, base_url=cfg.gameau_base_url)
+    notifier = TelegramNotifier(
+        bot_token=cfg.telegram_bot_token,
+        chat_id=cfg.telegram_chat_id,
+        rate_variant_1=cfg.rate_variant_1,
+        rate_variant_2=cfg.rate_variant_2,
+        active_variant=cfg.exchange_variant,
+        tron_energy_fee_rub=cfg.tron_energy_fee_rub,
+    )
+    tracker = TaskTracker(db)
+
+    try:
+        row = await db.get_order(order_id)
+        if row is None:
+            print(f"[ERR] Заказ #{order_id} не найден в базе.")
+            return 1
+        print(f"Ретрай заказа #{order_id} (текущий статус: {row.get('status')}, "
+              f"указанная цена: {row.get('price_rub')} ₽)")
+        result = await bot_control.retry_failed_order(
+            order_id=order_id,
+            db=db,
+            funpay_client=funpay,
+            gameau_client=gameau,
+            tg_notifier=notifier,
+            tracker=tracker,
+            default_quantity=cfg.default_stars_quantity,
+            max_charge_usdt=cfg.default_max_charge_usdt,
+            whitebird_rate=cfg.active_usdt_rate,
+            hide_sender=cfg.hide_sender,
+            max_order_retries=cfg.max_order_retries,
+            wait_completion_timeout=cfg.wait_completion_timeout,
+        )
+        print(f"Результат: {result}")
+        updated = await db.get_order(order_id)
+        if updated:
+            print(f"Новый статус: {updated['status']} "
+                  f"(затраты {updated.get('cost_usdt')} USDT, прибыль {updated.get('profit_rub')} ₽)")
+        return 0 if result.get("status") in ("completed", "unconfirmed") else 1
+    finally:
+        await funpay.close()
+        await gameau.close()
+        await notifier.close()
+        await db.close()
+
+
 async def cmd_stats_push(cfg: Config) -> int:
     """Отправка текущего отчёта в Telegram."""
     db = DBManager(cfg.db_path)
@@ -187,6 +292,7 @@ async def cmd_stats_push(cfg: Config) -> int:
         print("✅ Отчёт отправлен в Telegram." if ok else "❌ Не удалось отправить отчёт в Telegram.")
         return 0 if ok else 1
     finally:
+        await notifier.close()
         await db.close()
 
 
@@ -233,11 +339,20 @@ async def check_system(cfg: Config) -> bool:
             currency = acc.get("currency", "USD")
             plan = acc.get("plan", "Standard")
             print(f"[OK] Gameau API доступен. Баланс: {balance} {currency} (Тариф: {plan})")
+            try:
+                bal = float(balance)
+                if bal < cfg.low_balance_threshold_usdt:
+                    print(f"[WARN] Баланс ниже порога {cfg.low_balance_threshold_usdt:.2f} — "
+                          f"риск остановки выдачи (LOW_BALANCE)")
+            except (TypeError, ValueError):
+                pass
         else:
             print(f"[WARN] Gameau API вернул ответ: {acc}")
     except Exception as exc:
         print(f"[ERR] Gameau: {exc}")
         all_ok = False
+    finally:
+        await gameau.close()
 
     # 4. Telegram Notifier
     notifier = TelegramNotifier(
@@ -260,6 +375,10 @@ async def check_system(cfg: Config) -> bool:
     print(f"🗂 Трекинг задач: зависание > {cfg.stuck_task_minutes} мин, "
           f"согласование с GAMEAU каждые {cfg.reconciliation_interval_sec}s, "
           f"повторы при сбоях: {cfg.max_order_retries}")
+    print(f"💬 Чат-мониторинг WAITING_USERNAME каждые {cfg.chat_monitor_interval_sec}s "
+          f"(подхватывает @username из чата)")
+    print(f"💰 Контроль баланса GAMEAU: порог {cfg.low_balance_threshold_usdt:.2f} USDT, "
+          f"проверка каждые {cfg.balance_check_interval_min} мин")
     if cfg.stats_push_interval_min > 0:
         print(f"📊 Авто-отправка статистики в Telegram каждые {cfg.stats_push_interval_min} мин")
     else:
@@ -292,6 +411,8 @@ async def show_catalog(cfg: Config, item_type: str = "telegramStars") -> None:
         print("💡 Цены указаны по вашему тарифу на Gameau с учетом обоих вариантов обмена.")
     except Exception as exc:
         print(f"[ERR] Ошибка при загрузке каталога: {exc}")
+    finally:
+        await gameau.close()
 
 
 # ============================================================================ #
@@ -421,8 +542,10 @@ async def run_test_order(
         )
         print(f"Результат тестового заказа: {result}")
     finally:
-        await db.close()
         await funpay.close()
+        await gameau.close()
+        await notifier.close()
+        await db.close()
 
 
 # ============================================================================ #
@@ -453,6 +576,11 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
 
     db = DBManager(cfg.db_path)
     await db.init_db()
+
+    # Пауза, поставленная /pause или --pause, переживает перезапуск
+    if await bot_control.is_bot_paused(db):
+        logger.warning("Бот запущен в режиме ПАУЗЫ (новые заказы не принимаются). "
+                       "Снять: python -m autostars.main --resume или /resume в TG.")
 
     funpay = FunPayClient(
         golden_key=cfg.golden_key,
@@ -487,45 +615,110 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
             f"Курс USDT: Вариант {cfg.exchange_variant} = {cfg.active_usdt_rate:.2f} ₽\n"
             f"maxCharge: {cfg.default_max_charge_usdt} USDT | "
             f"Polling: {cfg.poll_interval:g}s | "
-            f"Reconcile: {cfg.reconciliation_interval_sec}s"
+            f"Reconcile: {cfg.reconciliation_interval_sec}s | "
+            f"ChatMonitor: {cfg.chat_monitor_interval_sec}s"
         )
+
+    # Баланс GAMEAU при старте (алерт, если ниже порога)
+    try:
+        balance = await bot_control.check_gameau_balance(
+            gameau, notifier, cfg.low_balance_threshold_usdt, alert=True
+        )
+        if balance:
+            logger.info(f"Баланс GAMEAU при старте: {balance['balance']:.2f} {balance['currency']}")
+    except Exception as exc:
+        logger.warning(f"Не удалось проверить баланс GAMEAU при старте: {exc}")
 
     tasks: set[asyncio.Task] = set()
     last_reconcile = 0.0
     last_stats_push = 0.0
+    last_chat_monitor = 0.0
+    last_balance_check = time.time()
     stats_push_sec = cfg.stats_push_interval_min * 60
+    balance_check_sec = cfg.balance_check_interval_min * 60
+
+    # Интерактивный TG-бот (команды /stats /pause /retry ...)
+    tg_stop = asyncio.Event()
+    tg_server = None
+    tg_task: Optional[asyncio.Task] = None
+    if notifier.is_configured:
+        tg_server = TelegramCommandServer(
+            notifier=notifier,
+            handlers=build_default_handlers(
+                cfg=cfg,
+                db=db,
+                gameau_client=gameau,
+                notifier=notifier,
+                stats=stats,
+                tracker=tracker,
+                loop_controls={
+                    "funpay": funpay,
+                    "gameau": gameau,
+                    "set_paused": lambda p: bot_control.set_bot_paused(db, p),
+                },
+            ),
+        )
+        tg_task = asyncio.create_task(tg_server.run(tg_stop), name="tg-commands")
+        logger.info("Интерактивный TG-бот: запущен (/help — список команд)")
 
     try:
         while True:
             try:
-                # Опрашиваем оплаченные заказы
-                paid_orders = await funpay.get_paid_orders()
-                if paid_orders:
-                    logger.info(f"Найдено оплаченных заказов: {len(paid_orders)}")
-                    for order in paid_orders:
-                        order_id = str(order["id"])
-                        if await db.is_order_processed(order_id):
-                            continue
+                now = time.time()
+                paused = await bot_control.is_bot_paused(db)
 
-                        # Асинхронная неблокирующая обработка каждого заказа
-                        task = asyncio.create_task(
-                            process_paid_order(
-                                order_data=order,
+                if not paused:
+                    # Опрашиваем оплаченные заказы
+                    paid_orders = await funpay.get_paid_orders()
+                    if paid_orders:
+                        logger.info(f"Найдено оплаченных заказов: {len(paid_orders)}")
+                        for order in paid_orders:
+                            order_id = str(order["id"])
+                            if await db.is_order_processed(order_id):
+                                continue
+
+                            # Асинхронная неблокирующая обработка каждого заказа
+                            task = asyncio.create_task(
+                                process_paid_order(
+                                    order_data=order,
+                                    funpay_client=funpay,
+                                    gameau_client=gameau,
+                                    db=db,
+                                    tg_notifier=notifier,
+                                    default_quantity=cfg.default_stars_quantity,
+                                    max_charge_usdt=cfg.default_max_charge_usdt,
+                                    whitebird_rate=cfg.active_usdt_rate,
+                                    hide_sender=cfg.hide_sender,
+                                    task_tracker=tracker,
+                                    max_order_retries=cfg.max_order_retries,
+                                    wait_completion_timeout=cfg.wait_completion_timeout,
+                                )
+                            )
+                            tasks.add(task)
+                            task.add_done_callback(tasks.discard)
+
+                    # Чат-мониторинг: подхватываем @username, который покупатель
+                    # написал в чате (заказы WAITING_USERNAME)
+                    if now - last_chat_monitor >= cfg.chat_monitor_interval_sec:
+                        last_chat_monitor = now
+                        try:
+                            await bot_control.process_waiting_username_orders(
+                                db=db,
                                 funpay_client=funpay,
                                 gameau_client=gameau,
-                                db=db,
                                 tg_notifier=notifier,
+                                tracker=tracker,
                                 default_quantity=cfg.default_stars_quantity,
                                 max_charge_usdt=cfg.default_max_charge_usdt,
                                 whitebird_rate=cfg.active_usdt_rate,
                                 hide_sender=cfg.hide_sender,
-                                task_tracker=tracker,
                                 max_order_retries=cfg.max_order_retries,
                                 wait_completion_timeout=cfg.wait_completion_timeout,
                             )
-                        )
-                        tasks.add(task)
-                        task.add_done_callback(tasks.discard)
+                        except Exception as exc:
+                            logger.error(f"Ошибка чат-мониторинга: {exc}", exc_info=True)
+                else:
+                    logger.debug("Бот в паузе — приём новых заказов остановлен")
 
                 if once:
                     if tasks:
@@ -537,7 +730,6 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
                 await funpay.poll_runner()
 
                 # Авто-согласование незавершённых задач с GAMEAU
-                now = time.time()
                 if now - last_reconcile >= cfg.reconciliation_interval_sec:
                     last_reconcile = now
                     try:
@@ -560,12 +752,29 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
                     except Exception as exc:
                         logger.error(f"Ошибка отправки периодической статистики: {exc}", exc_info=True)
 
+                # Периодическая проверка баланса GAMEAU
+                if balance_check_sec > 0 and now - last_balance_check >= balance_check_sec:
+                    last_balance_check = now
+                    try:
+                        await bot_control.check_gameau_balance(
+                            gameau, notifier, cfg.low_balance_threshold_usdt, alert=True
+                        )
+                    except Exception as exc:
+                        logger.error(f"Ошибка проверки баланса: {exc}", exc_info=True)
+
             except Exception as exc:
                 logger.error(f"Ошибка в цикле автовыдачи: {exc}", exc_info=True)
 
             await asyncio.sleep(cfg.poll_interval)
 
     finally:
+        tg_stop.set()
+        if tg_task is not None:
+            tg_task.cancel()
+            try:
+                await tg_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if notifier.is_configured:
@@ -574,6 +783,10 @@ async def run_bot(cfg: Config, once: bool = False) -> None:
             except Exception:
                 pass
         await funpay.close()
+        await gameau.close()
+        if tg_server is not None:
+            await tg_server.close()
+        await notifier.close()
         await db.close()
 
 
@@ -606,6 +819,14 @@ def main() -> None:
         help="полный жизненный цикл задачи по ID заказа FunPay",
     )
     parser.add_argument("--stats-push", action="store_true", help="отправить текущую статистику в Telegram")
+    parser.add_argument("--balance", action="store_true", help="баланс GAMEAU (сколько заказов ещё осилить)")
+    parser.add_argument("--pause", action="store_true", help="остановить приём новых заказов (переживает рестарт)")
+    parser.add_argument("--resume", action="store_true", help="возобновить приём новых заказов")
+    parser.add_argument(
+        "--retry-order",
+        metavar="ORDER_ID",
+        help="повторить проваленный заказ (идемпотентно: без дубля покупки)",
+    )
     parser.add_argument("--config", default="config.json", help="путь к файлу конфигурации")
     parser.add_argument("-v", "--verbose", action="store_true", help="подробный отладочный вывод")
     parser.add_argument(
@@ -667,6 +888,23 @@ def main() -> None:
 
     if args.stats_push:
         sys.exit(asyncio.run(cmd_stats_push(cfg)))
+
+    if args.balance:
+        sys.exit(asyncio.run(cmd_balance(cfg)))
+
+    if args.pause:
+        sys.exit(asyncio.run(cmd_pause(cfg, pause=True)))
+
+    if args.resume:
+        sys.exit(asyncio.run(cmd_pause(cfg, pause=False)))
+
+    if args.retry_order:
+        try:
+            cfg.validate()
+        except ValueError as exc:
+            print(f"[ERR] {exc}")
+            sys.exit(1)
+        sys.exit(asyncio.run(cmd_retry(cfg, args.retry_order)))
 
     if args.test_order:
         try:
