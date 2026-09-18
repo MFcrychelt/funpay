@@ -1,292 +1,268 @@
 # 🌟 AutoStars — автовыдача Telegram Stars на FunPay через GAMEAU
 
-Автоматизированная система выдачи Telegram Stars покупателям FunPay.
-Заказы оплачиваются в рублях на FunPay, себестоимость — USDT TRC-20,
-заводимые на баланс [gameau.us](https://gameau.us) через один из двух
-обменных маршрутов. Выдача звёзд — через GAMEAU REST API v1
+Автоматизированная выдача Telegram Stars покупателям FunPay. Покупатель платит
+рубли на FunPay, себестоимость — USDT TRC-20 на балансе [gameau.us](https://gameau.us)
+(один из двух маршрутов завода), сама выдача идёт через GAMEAU REST API v1
 ([документация](https://gameau.us/api-docs.html)).
 
-Проект разрабатывается на основе [AutoStars-New](https://github.com/Vamp1reAchao/AutoStars).
-Основной движок — пакет `autostars/` (async, httpx + aiosqlite).
-Наследованные `main.py` / `bot/` / `gui.py` — исходный релиз AutoStars-New.
+Поддерживаемый движок — пакет [`autostars/`](autostars) (async: `httpx` + `aiosqlite`).
+Рядом лежит **тот же** функционал в трёх оболочках: CLI (`autostars_bot.py`),
+настольный GUI на flet (`autostars_gui.py`) и Docker/systemd — все они управляют
+одним процессом и одной базой, «своей» логики выдачи в GUI нет.
 
-## ✨ Возможности
+Исходный релиз AutoStars-New (`main.py` + `bot/` + `gui.py`) изолирован в
+[`legacy/`](legacy) и не поддерживается — [почему](legacy/README.md).
+
+## ✨ Что умеет
 
 - 🤖 **Автовыдача** — опрос оплаченных заказов FunPay (HTML + long polling `runner/`),
-  автоматическое извлечение `@username` и количества звёзд, покупка через GAMEAU API
-- 🛡️ **Надёжность** — `Idempotency-Key` (UUID v5 от order_id), контроль `maxCharge`,
-  ретраи при сетевых сбоях (429/502/503/504), ожидание финального статуса заказа GAMEAU
-- 🗂 **Трекинг выполнения задач** — журнал жизненного цикла каждого заказа
-  (получен → распознан → пакет выбран → заказ в GAMEAU → выдано → ответ покупателю → алерт),
-  детектор «зависших» задач, авто-согласование (reconciliation) незавершённых
-  заказов с GAMEAU, развёрнутый алерт о зависании (без дублей)
-- 📊 **Статистика за окно** — 1 час / 2 часа / 3 часа / 4 часа / 6 часов / 24 часа /
-  календарный день / всего: заказы, звёзды, выручка, затраты (USDT и ₽), прибыль, маржа
-- 💸 **Расчёты убытков / прибыли / затрат** — два курса завода USDT
-  (Вариант 1: анонимный обмен ~110 ₽, Вариант 2: Беларусь Whitebird ~87.63 ₽),
-  убыточные сделки (маржа < 0), потерянная выручка по проваленным заказам,
-  списанные без выдачи средства, P&L-отчёт
-- 📱 **Telegram-уведомления** — каждую сделку с расчётом прибыли по обоим вариантам,
-  критические алерты (LOW_BALANCE, PRICE_EXCEEDED, ошибки выдачи), периодическая
-  авто-отправка статистики
-- 📲 **Управление с телефона** — интерактивный TG-бот (long polling, без вебхука):
-  `/stats /report /tasks /balance /status /pause /resume /retry <id> /calc` —
-  только для владельца (chat_id из `.env`)
-- 💬 **Чат-мониторинг** — если бот попросил у покупателя @username, а тот написал
-  его в чате FunPay — выдача стартует автоматически (без повторного запроса и
-  без спама)
-- 🧯 **Устойчивость** — пауза/резюм (`--pause`/`--resume`, переживают рестарт),
-  ретрай проваленных заказов (`--retry-order`, идемпотентно), контроль баланса
-  GAMEAU с порогом и алертом, `--balance`
-- ⚡ **Отзывчивость** — персистентные HTTP-соединения (пул, без TLS-хендшейка на
-  запрос), long polling у FunPay и Telegram, параллельная обработка заказов
-- 📝 **Логирование** — консоль + ротируемый файл (`RotatingFileHandler`, 5 МБ × 5)
+  извлечение `@username` и количества звёзд, покупка пакета через GAMEAU, ответ покупателю
+- 🛡️ **Денежная защита** — `Idempotency-Key` (UUID v5 от номера заказа), лимит
+  `maxCharge` от цены пакета из каталога (+`MAX_CHARGE_MARGIN_PCT`), фактическая
+  себестоимость по `chargedAmount`, ретраи только на сетевые 429/5xx
+- 🗂 **Трекинг задач** — журнал жизненного цикла заказа, детектор «зависших»,
+  авто-согласование (reconciliation) незавершённых заказов с GAMEAU
+- 📊 **Статистика и P&L** — окна 1/2/3/4/6/24 ч, календарный день и «всего»: заказы,
+  звёзды, выручка ₽, затраты USDT/₽, прибыль, маржа, убыточные сделки, провалы
+- 📱 **Telegram** — алерт по каждой сделке (прибыль по обоим курсам), критические
+  события, авто-отправка статистики и **управление с телефона**: `/status /stats
+  /report /tasks /balance /pause /resume /retry <id> /calc /stop`
+- 💬 **Чат-мониторинг** — если покупатель написал `@username` в чат FunPay, выдача
+  стартует сама, без повторного запроса
+- 🖥 **GUI (flet)** — запуск/остановка цикла, статус, статистика, заказы, хвост логов,
+  редактор настроек с проверкой значений; секреты в форме не показываются
+- 📦 **Установка в один клик** — `install.bat` (Windows) / `pip install -e .`, сборка
+  `.exe` через `build.bat`, самодиагностика `check_env.py`
+- ⚙️ **Эксплуатация** — пауза/резюм, ретрай заказа, `--check`, `--config-show`,
+  `--stats --json` (для дашбордов), graceful shutdown, `.env` / `config.json` /
+  переменные окружения на выбор
 
 ## 📁 Структура
 
 ```
-autostars/                  # основной движок (async)
-├── main.py                 # CLI-точка входа и главный цикл автовыдачи
-├── config.py               # конфигурация (.env + config.json)
+autostars/                    # поддерживаемый движок (async)
+├── main.py                   # CLI + главный цикл автовыдачи (запуск, shutdown, /stop)
+├── config.py                 # конфигурация: .env + config.json + env, диагностика ошибок
+├── paths.py                  # пути приложения (.env/БД/лог рядом с exe или проектом)
+├── security.py               # маскирование и redact секретов в логах
 ├── clients/
-│   ├── funpay.py           # FunPay: csrf, long polling, оплаченные заказы, чаты
-│   └── gameau.py           # GAMEAU API v1: каталог, telegramStars, статусы, баланс
+│   ├── funpay.py             # FunPay: csrf, long polling runner/, чаты, ответы
+│   └── gameau.py             # GAMEAU API v1: каталог, telegramStars, статусы, баланс
 ├── database/
-│   ├── models.py           # схемы SQLite (orders, task_events, idempotency, settings)
-│   └── db_manager.py       # CRUD, миграции, агрегация статистики по окнам
+│   ├── models.py             # схема SQLite (orders, task_events, idempotency, settings)
+│   └── db_manager.py         # CRUD, WAL/busy_timeout, миграции, агрегаты статистики
+├── services/
+│   ├── parser.py             # @username / t.me/... / количество звёзд из текста
+│   ├── order_processor.py    # пайплайн: парсинг → GAMEAU → ответ → алерт (ретраи, семафор)
+│   ├── statistics.py         # окна статистики, убытки, отчёты, JSON
+│   ├── task_tracker.py       # события задач, «зависшие», reconciliation
+│   └── bot_control.py        # пауза/резюм, флаг в БД, состояние цикла
 ├── notifier/
-│   └── tg_alert.py         # Telegram-алерты + калькуляция прибыли
-└── services/
-    ├── parser.py           # разбор @username / t.me/... / количества звёзд
-    ├── order_processor.py  # пайплайн: парсинг → GAMEAU → ответ → алерт (с ретраями)
-    ├── statistics.py       # статистика 1ч/2ч/3ч/4ч/6ч/24ч/день/всего, убытки, отчёты
-    └── task_tracker.py     # трекер задач: события, зависшие, reconciliation
-tests/                      # pytest: 95 тестов (окна, трекер, ретраи, миграции, ...)
-main.py, gui.py, bot/       # наследованный AutoStars-New (legacy)
+│   ├── tg_alert.py           # Telegram-алерты + калькуляция прибыли
+│   └── tg_commands.py        # интерактивный бот владельца (long polling)
+└── gui/                      # настольный интерфейс (flet), thin-контроллер над движком
+    ├── bridge.py             # запуск/остановка процесса, чтение БД/логов (без flet!)
+    ├── settings.py           # редактор .env: валидация, бэкап, сохранение комментариев
+    └── app.py                # вкладки: Главная · Статистика · Заказы · Настройки · Логи · Диагностика
+
+autostars_bot.py              # точка входа CLI (для pythonw/exe)
+autostars_gui.py              # точка входа GUI
+check_env.py                  # самодиагностика окружения (python, пакеты, ключи, пути)
+install.bat · start_gui.bat · run_bot.bat · build.bat   # Windows: установка, запуск, сборка exe
+autostars.spec                # профиль PyInstaller для CLI (GUI собирается через `flet pack`)
+config.example.json · .env.example                      # примеры конфигурации
+Dockerfile · docker-compose.yml · deploy/autostars.service
+tests/                        # pytest движка, CLI, моста GUI и настроек
+tools/gui_smoke.py            # headless-проверка, что интерфейс собирается
+legacy/                       # исходный AutoStars-New: main.py, bot/, gui.py, свои тесты
+.github/workflows/ci.yml      # CI: линтер, тесты, смоук CLI, GUI-смоук, docker build
+docs/                         # ARCHITECTURE · SECURITY · TESTING · WINDOWS_BUILD · REFERENCES
 ```
 
 ## 🚀 Быстрый старт
 
-```bash
-# 1. Зависимости
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
+### Windows (без консоли и без Python-ритуалов)
 
-# 2. Конфигурация
-cp .env.example .env
-nano .env    # FUNPAY_GOLDEN_KEY, GAMEAU_API_KEY, TELEGRAM_*
-
-# 3. Диагностика
-python -m autostars.main --check
-
-# 4. Тестовый заказ (50 звёзд на своего аккаунт)
-python -m autostars.main --test-order your_username
-
-# 5. Запуск автовыдачи
-python -m autostars.main
+```bat
+git clone https://github.com/MFcrychelt/funpay.git && cd funpay
+install.bat            :: создаёт .venv, ставит пакеты, копирует .env.example → .env, показывает check_env
+notepad .env           :: FUNPAY_GOLDEN_KEY, GAMEAU_API_KEY (TELEGRAM_* — по желанию)
+start_gui.bat          :: графическая оболочка: «▶ Запустить цикл»
 ```
 
-Docker:
+Нужен только запуск в консоли? `run_bot.bat --check`, затем `run_bot.bat`.
+Хотите `.exe` без Python на машине — `build.bat`, папка `dist\` ([подробно](docs/WINDOWS_BUILD.md)).
+
+### Linux / macOS / venv
+
+```bash
+git clone https://github.com/MFcrychelt/funpay.git && cd funpay
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .              # ядро;  с интерфейсом: pip install -e ".[gui]"
+
+cp .env.example .env          # или запустите что угодно — .env создастся сам
+nano .env
+
+python check_env.py           # окружение, версии пакетов, права, наличие ключей
+autostars --check             # диагностика: конфиг → SQLite → FunPay → GAMEAU → курсы
+autostars --test-order your_username --dry-run   # смета теста (50⭐), ничего не покупает
+autostars --test-order your_username --test-qty 20 -y   # реальная проверка на своём аккаунте
+autostars                     # основной цикл автовыдачи
+```
+
+`autostars` — консольный скрипт из `pyproject.toml`; он равен
+`python -m autostars.main`. Интерфейс: `autostars-gui` или `python autostars_gui.py`.
+
+### Docker / systemd
 
 ```bash
 cp .env.example .env && nano .env
-docker compose up -d --build
-docker compose logs -f
+docker compose up -d --build && docker compose logs -f
 ```
+
+Для установки на VPS без Docker — [deploy/autostars.service](deploy/autostars.service)
+(`AUTOSTARS_HOME=/var/lib/autostars`, `EnvironmentFile=.env`, `TimeoutStopSec=90`,
+`Restart=always`). В обоих случаях движок использует те же файлы и ту же базу — можно
+переезжать с Docker на systemd без миграции.
+
+## 📊 Команды CLI
+
+Все команды работают и в исходниках, и в exe (`AutoStarsBot.exe --check`).
+Машинный вывод — флагом `--json` (для `--stats`, `--report`, `--tasks`, `--balance`).
+
+| Команда | Назначение |
+|---|---|
+| `autostars` | основной цикл: опрос FunPay + long polling + чат-мониторинг + reconcile |
+| `--once` | однократный проход по очереди (cron) |
+| `--check` | диагностика: конфиг, SQLite, FunPay, GAMEAU, каталог, курсы, Telegram |
+| `--config-show` | применённая конфигурация и источники (секреты замаскированы) |
+| `--catalog` | каталог GAMEAU с себестоимостью по обоим курсам |
+| `--calc 1370.40 [1000] [USDT]` | калькулятор прибыли: Вариант 1 против Варианта 2 |
+| `--deposit-info` | как завести USDT TRC-20 (оба маршрута, комиссии, риски) |
+| `--stats` / `--report` | статистика по окнам / полный отчёт (P&L, убытки, топ, провалы) |
+| `--stats-hours 1,6,24` | свои часовые окна для `--stats` |
+| `--tasks` / `--timeline <ID>` | открытые и зависшие задачи / журнал одной задачи |
+| `--stats-push` | отправить текущую статистику в Telegram |
+| `--balance` | баланс GAMEAU + «на сколько заказов 1000⭐ хватит» |
+| `--pause` / `--resume` | пауза приёма новых заказов (флаг в БД, переживает рестарт) |
+| `--retry-order <ID>` | повторить проваленный заказ (идемпотентно, без двойной покупки) |
+| `--test-order <username>` `--test-qty 50` `--dry-run` `-y` | проверка выдачи на своём аккаунте |
+| `--config PATH` | явный `config.json` вместо `.env` |
+| `-v` / `--version` | отладочный уровень / версия |
+
+Коды возврата: `0` — ок, `1` — есть проблемы (нет ключей, сеть, заказ не найден),
+`2` — нужна явная отмашка (например, `--test-order` без `--yes`).
+
+### Управление с телефона
+
+Живой цикл слушает команды **только владельца** (`TELEGRAM_CHAT_ID`), long polling —
+вебхук и открытые порты не нужны: `/help` `/status` `/stop` `/pause` `/resume`
+`/stats` `/report` `/tasks` `/balance` `/retry 123456` `/calc 1370.4 1000`.
 
 ## 💰 Финансовая модель (USDT TRC-20 → gameau.us)
 
 | | Вариант 1 | Вариант 2 (рекомендуется) |
 |---|---|---|
-| Маршрут | Анонимный обмен / P2P (Telegram Wallet, BestChange, криптоматы) | Беларусь, Whitebird — обмен с карты без P2P (KYC) |
+| Маршрут | Анонимный обмен / P2P (Telegram Wallet, BestChange, криптоматы) | Беларусь, Whitebird — обмен по карте, без P2P |
 | Курс | ~110.00 ₽ / USDT | ~87.63 ₽ / USDT |
-| Себестоимость 1000 Stars (9.10 USDT) | ~1001.00 ₽ | ~797.43 ₽ |
-| Прибыль при продаже за 1370.40 ₽ | +369.40 ₽ | +572.97 ₽ |
+| Себестоимость 1000⭐ (9.10 USDT) | ~1001.00 ₽ | ~797.43 ₽ |
+| Прибыль при продаже за 1370.40 ₽ | +369.40 ₽ (маржа 27.0 %) | +572.97 ₽ (маржа 41.8 %) |
 
-Активный вариант выбирается `EXCHANGE_VARIANT=1|2`. По каждой сделке бот
-сообщает прибыль **по обоим** вариантам; статистика считает затраты по активному.
-
-Инструкция по заводу крипты: `python -m autostars.main --deposit-info`
-Калькулятор: `python -m autostars.main --calc 1370.40 1000`
-
-## 📊 Команды управления
-
-| Команда | Назначение |
-|---|---|
-| `python -m autostars.main` | основной цикл автовыдачи (опрос + long polling + reconcile) |
-| `--once` | однократный проход по очереди (для cron) |
-| `--check` | диагностика: FunPay, GAMEAU, SQLite, Telegram, курсы |
-| `--catalog` | каталог GAMEAU с себестоимостью по обоим вариантам курса |
-| `--calc 1370.4 [1000]` | калькулятор прибыли (Вариант 1 vs Вариант 2) |
-| `--deposit-info` | инструкция по заводу USDT TRC-20 |
-| `--test-order USERNAME` | тестовый заказ (по умолчанию 50 звёзд, `--test-qty`) |
-| **`--stats`** | **статистика за 1/2/3/4/6/24 часа, календарный день и всего** (`--stats-hours 1,6,24` — свои окна) |
-| **`--report`** | **полный отчёт: P&L, убытки, топ сделок, провалы, трекинг задач** |
-| **`--tasks`** | **трекинг задач: открытые, зависшие, журнал событий** |
-| **`--timeline 123456`** | **жизненный цикл конкретной задачи** |
-| `--stats-push` | отправить текущую статистику в Telegram |
-| `--balance` | баланс GAMEAU и на сколько заказов 1000⭐ его хватит |
-| `--pause` / `--resume` | пауза / возобновление приёма новых заказов (переживает рестарт) |
-| `--retry-order 123456` | повторить проваленный заказ (идемпотентно — без дубля покупки) |
-
-### Управление с Telegram
-
-В живом цикле (`python -m autostars.main`) бот слушает команды **только от
-владельца** (long polling `getUpdates`, вебхук-сервер не нужен):
-
-| Команда | Что делает |
-|---|---|
-| `/help` | список команд |
-| `/status` | работает/пауза, задачи по статусам, баланс GAMEAU |
-| `/stats` | статистика 1ч / 24ч / сегодня / всего |
-| `/report` | полный отчёт: P&L, убытки, топ сделок, провалы |
-| `/tasks` | открытые и зависшие задачи + журнал |
-| `/balance` | баланс GAMEAU (алерт, если ниже порога) |
-| `/pause`, `/resume` | остановить / возобновить приём новых заказов |
-| `/retry 123456` | повторить проваленный заказ прямо из Telegram |
-| `/calc 1370.4 [1000]` | калькулятор прибыли по обоим курсам |
-
-### Примеры вывода
-
-`--stats`:
-
-```
-======================================================================================================================
-ОКНО             | Заказы |   OK | FAIL | В раб. |   Звёзды |    Выручка ₽ |     USDT |    Затраты ₽ |    Прибыль ₽ |  Маржа
-----------------------------------------------------------------------------------------------------------------------
-1 час            |      2 |    1 |    0 |      1 |     1000 |     1 370.40 |     9.10 |       797.43 |       572.97 |  41.8%
-2 часа           |      3 |    2 |    0 |      1 |     1500 |     2 055.60 |    13.65 |     1 196.15 |       857.63 |  41.7%
-3 часа           |      3 |    2 |    0 |      1 |     1500 |     2 055.60 |    13.65 |     1 196.15 |       857.63 |  41.7%
-4 часа           |      4 |    2 |    1 |      1 |     1500 |     2 055.60 |    13.65 |     1 196.15 |       857.63 |  41.7%
-6 часов          |      4 |    2 |    1 |      1 |     1500 |     2 055.60 |    13.65 |     1 196.15 |       857.63 |  41.7%
-24 часа          |      5 |    3 |    1 |      1 |     3500 |     4 796.40 |    31.85 |     2 791.02 |     2 010.10 |  41.9%
-Сегодня (с 00:00) |      4 |    2 |    1 |      1 |     1500 |     2 055.60 |    13.65 |     1 196.15 |       857.63 |  41.7%
-Всего            |      6 |    4 |    1 |      1 |     4500 |     6 166.80 |    40.95 |     3 588.45 |     2 583.07 |  41.9%
-======================================================================================================================
-Убыточные сделки: 0 (−0.00 ₽) | Провалено заказов: 1 (потерянная выручка: 1 370.40 ₽) | ...
-```
-
-`--timeline`:
-
-```
-📋 ЗАДАЧА #SM-4 — PROCESSING
-   Получатель: @olga_77 | Звёзды: 1000 | Цена: 1370.4 ₽ | Затраты: 0.0 USDT
-   GAMEAU ID: G-4 | Ошибка: —
-
-Журнал выполнения:
-   18.09 10:07:19 | RECEIVED         | price=1370.4₽
-   18.09 10:07:19 | PARSED_OK        | username=@olga_77, quantity=1000
-   18.09 10:08:19 | GAMEAU_CREATED   | gameau_id=G-4 maxCharge=9.5 USDT
-```
-
-## 🗂 Трекинг выполнения задач
-
-Каждый заказ — задача с журналом событий (`task_events`):
-
-`RECEIVED → PARSED_OK/PARSED_FAIL → PACKAGE_SELECTED → GAMEAU_CREATED →
-GAMEAU_COMPLETED/GAMEAU_FAILED → FUNPAY_REPLY → TG_ALERT → COMPLETED/FAILED`
-(плюс `RETRY`, `WAITING_USERNAME`, `STUCK_ALERTED`, `CANCELLED`).
-
-Механизмы:
-- **Reconciliation** — каждые `RECONCILIATION_INTERVAL_SEC` (60 c) бот допрашивает
-  GAMEAU по ID незавершённых заказов: выполнился → закрывает сделку (ответ
-  покупателю + алерт), отклонён → помечает `FAILED_DELIVERY` с фактической
-  себестоимостью, завис → алерт владельцу (раз в час на задачу).
-- **Детектор зависших задач** — `STUCK_TASK_MINUTES` (20) без обновлений.
-- **Чат-мониторинг** — каждые `CHAT_MONITOR_INTERVAL_SEC` (15 c) по заказам
-  `WAITING_USERNAME` читается последнее сообщение покупателя в чате FunPay;
-  как только появился `@username` (и, возможно, количество звёзд) — выдача
-  запускается автоматически. Запрос ника не дублируется.
-- **Пауза/резюм** — флаг в БД (`--pause`, `--resume`, TG `/pause` `/resume`),
-  переживает перезапуск процесса; в паузе новые заказы не принимаются,
-  а в работе принятые заказы и reconciliation.
-- **Ретрай** — `--retry-order ID` / TG `/retry ID` для `FAILED*` статусов.
-  Идемпотентно: `Idempotency-Key` детерминирован по order_id, GAMEAU вернёт
-  тот же заказ, если он был создан ранее — дубль покупки невозможен.
-- **Контроль баланса GAMEAU** — при старте и каждые `BALANCE_CHECK_INTERVAL_MIN`
-  (10 мин); ниже `LOW_BALANCE_THRESHOLD_USDT` (50) — алерт владельцу.
-  `--balance` — текущий остаток и прогноз «хватит на N заказов».
-- **Идемпотентность** — заказ с любой заведённой записью в БД не уходит в
-  пайплайн повторно (включая FAILED — исключены дубли ответов покупателю);
-  ключи идемпотентности — против дублей покупок.
-
-## 📈 Статистика и убытки
-
-Окна: **1 час, 2 часа, 3 часа, 4 часа, 6 часов, 24 часа, календарный день
-(с 00:00 локального времени сервера), всего**. По каждому окну:
-
-- заказы: всего / выполнено / провалено / в работе / ожидание ника
-- звёзды выдано (по завершённым)
-- выручка ₽, затраты USDT и ₽ (по активному курсу + трон-комиссия)
-- прибыль ₽, маржа %, средняя/лучшая сделка
-- **убытки**: убыточные сделки (маржа < 0) с суммой; проваленные заказы с
-  суммой потерянной выручки; средства, списанные GAMEAU без выдачи
-
-Отчёт уезжает в Telegram: `STATS_PUSH_INTERVAL_MIN=60` — каждые час;
-`--stats-push` — вручную. В `--report` — P&L, топ сделок, провалы и
-убыточные сделки за 24 часа.
-
-## ⚡ Отзывчивость
-
-- **Персистентные HTTP-соединения**: GAMEAU- и Telegram-клиенты держат пул
-  соединений (httpx `AsyncClient` на весь цикл) — нет TLS-хендшейка на каждый
-  запрос, покупки уходят быстрее.
-- **Long polling** у FunPay (`runner/`) и Telegram (`getUpdates`, timeout 50 c)
-  — команды и события обрабатываются почти мгновенно.
-- **Параллельная обработка**: каждый новый заказ — отдельная asyncio-задача,
-  блокирующее ожидание статуса GAMEAU не останавливает очередь.
-- Каталог GAMEAU кешируется на 60 c (`find_stars_package`).
-- Дефолтный цикл: `POLL_INTERVAL=5s`, чат-мониторинг 15 c, reconciliation 60 c.
-
-## 📝 Логирование
-
-- Консоль + файл `LOG_FILE` (по умолчанию `autostars.log`),
-  ротация `LOG_MAX_BYTES` (5 МБ) × `LOG_BACKUP_COUNT` (5)
-- `-v` — отладочный уровень
-- Каждая задача пишет события в общий лог и в журнал `task_events`
-
-## ⚙️ Основные параметры (.env)
-
-| Переменная | По умолчанию | Описание |
-|---|---|---|
-| `FUNPAY_GOLDEN_KEY` | — | ключ продавца FunPay (обязательно) |
-| `GAMEAU_API_KEY` | — | API-ключ gameau.us (обязательно) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | уведомления владельцу |
-| `EXCHANGE_VARIANT` | `2` | активный курс: 1 = анонимный 110 ₽, 2 = Whitebird 87.63 ₽ |
-| `RATE_VARIANT_1` / `RATE_VARIANT_2` | `110.00` / `87.63` | курсы ₽/USDT |
-| `DEFAULT_MAX_CHARGE_USDT` | `9.50` | лимит списания за заказ (защита от пересписания) |
-| `POLL_INTERVAL` | `5.0` | опрос очереди, сек |
-| `STUCK_TASK_MINUTES` | `20` | порог «зависшей» задачи |
-| `RECONCILIATION_INTERVAL_SEC` | `60` | интервал согласования с GAMEAU |
-| `MAX_ORDER_RETRIES` | `2` | повторы при сетевых сбоях GAMEAU |
-| `WAIT_COMPLETION_TIMEOUT` | `120` | ожидание финального статуса заказа GAMEAU |
-| `STATS_PUSH_INTERVAL_MIN` | `0` | авто-статистика в TG (0 = выкл) |
-| `CHAT_MONITOR_INTERVAL_SEC` | `15` | опрос чатов WAITING_USERNAME (подхват @username) |
-| `LOW_BALANCE_THRESHOLD_USDT` | `50.0` | порог алерта о балансе GAMEAU |
-| `BALANCE_CHECK_INTERVAL_MIN` | `10` | периодичность проверки баланса |
-| `DB_PATH` / `LOG_FILE` | `autostars.db` / `autostars.log` | хранение |
-
-## 🧪 Тесты
+Активный курс — `EXCHANGE_VARIANT=1|2`. По каждой сделке Telegram-алерт считает
+прибыль **по обоим** вариантам, статистика — по активному.
 
 ```bash
-pip install pytest anyio pytest-timeout
-python -m pytest tests/ -q
+autostars --calc 1370.4 1000
+# • Вариант 1 (анонимный обмен/P2P, 110.00 ₽/USDT)  себестоимость 1001.00 ₽ | прибыль +369.40 ₽ | маржа 27.0%
+# • Вариант 2 (Whitebird (РБ), 87.63 ₽/USDT) 💰     себестоимость  797.43 ₽ | прибыль +572.97 ₽ | маржа 41.8%
 ```
 
-114 тестов: окна статистики, убытки, трекер задач, reconciliation, ретраи,
-фактическая себестоимость (`chargedAmount`), миграция legacy-баз, парсеры,
-CSRF-восстановление FunPay, GAMEAU-клиент, Telegram-алерты, чат-мониторинг,
-пауза/ретрай/баланс, TG-команды (разрешение, dispatch, long-poll цикл),
-персистентные соединения.
+## ⚙️ Конфигурация
 
-## 🔒 Безопасность
+Источники, приоритет сверху вниз: **переменные процесса** → **`.env`** →
+**`config.json`** → значения по умолчанию в коде. Файлы ищутся рядом с exe /
+корнем проекта; переопределяется `AUTOSTARS_HOME`, `.env` — `AUTOSTARS_ENV`,
+`config.json` — `--config` / `AUTOSTARS_CONFIG`. Пример JSON —
+[config.example.json](config.example.json) (ключи те же, что в `.env`).
 
-- Ключи только в `.env` (в `.gitignore`), не публикуются
-- `maxCharge` защищает от списания больше согласованной суммы
-  (409 `PRICE_CHANGED` при росте цены — ничего не списывается)
-- `Idempotency-Key` исключает двойные покупки при ретраях
-- API-ключ GAMEAU не передаётся никуда, кроме `gameau.us`
+| Переменная | По умолчанию | Зачем |
+|---|---|---|
+| `FUNPAY_GOLDEN_KEY` | — | ключ продавца FunPay (**обязательно**) |
+| `GAMEAU_API_KEY` | — | API-ключ gameau.us (**обязательно**) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | алерты и команды владельца |
+| `EXCHANGE_VARIANT` | `2` | активный курс завода: 1 = P2P 110 ₽, 2 = Whitebird 87.63 ₽ |
+| `RATE_VARIANT_1` / `RATE_VARIANT_2` | `110.00` / `87.63` | курсы ₽/USDT |
+| `USDT_PER_1000_STARS` | `9.10` | оценка себестоимости, когда каталог недоступен |
+| `DEFAULT_MAX_CHARGE_USDT` | `9.50` | нижняя граница лимита списания на заказ |
+| `MAX_CHARGE_MARGIN_PCT` | `5` | запас к цене пакета из каталога в `maxCharge` |
+| `TRON_ENERGY_FEE_RUB` | `0` | комиссия завода на сделку (влияет на прибыль) |
+| `HIDE_SENDER` | `false` | скрывать отправителя звёзд |
+| `POLL_INTERVAL` | `5.0` | опрос очереди, сек |
+| `DEFAULT_STARS_QUANTITY` | `1000` | звёзды, если количество не распознано |
+| `CHAT_MONITOR_INTERVAL_SEC` | `15` | подхват `@username` из чата FunPay |
+| `STUCK_TASK_MINUTES` | `20` | порог «зависшей» задачи |
+| `RECONCILIATION_INTERVAL_SEC` | `60` | согласование незавершённых заказов с GAMEAU |
+| `MAX_ORDER_RETRIES` | `2` | повторы при сетевых сбоях GAMEAU |
+| `WAIT_COMPLETION_TIMEOUT` | `120` | ожидание финального статуса GAMEAU |
+| `MAX_CONCURRENT_ORDERS` | `4` | сколько заказов вести параллельно (семафор) |
+| `SHUTDOWN_TIMEOUT_SEC` | `30` | сколько ждать начатые выдачи при остановке |
+| `STARTUP_RETRY_DELAY` / `STARTUP_MAX_RETRIES` | `15` / `0` | повторы логина при старте (`0` = вечно) |
+| `LOW_BALANCE_THRESHOLD_USDT` / `BALANCE_CHECK_INTERVAL_MIN` | `50.0` / `10` | контроль баланса GAMEAU и алерт |
+| `STATS_PUSH_INTERVAL_MIN` | `0` | авто-статистика в Telegram (`0` — выкл) |
+| `DB_PATH` / `LOG_FILE` | `autostars.db` / `autostars.log` | где лежать базе и логу |
+| `LOG_MAX_BYTES` × `LOG_BACKUP_COUNT` | `5000000` × `5` | ротация лога |
+| `GAMEAU_BASE_URL` / `GAMEAU_TIMEOUT` / `GAMEAU_MAX_RETRIES` | `https://gameau.us/api/v1` / `20` / `3` | сеть до GAMEAU |
+| `FUNPAY_BASE_URL` / `FUNPAY_USER_AGENT` | `https://funpay.com` / Chrome UA | доступ к FunPay (403 лечается UA) |
+
+Полный список с пояснениями — [.env.example](.env.example); он же источник
+подсказок в GUI, и расхождение «пример ↔ код ↔ форма» ловит тест
+[tests/test_config_drift.py](tests/test_config_drift.py).
+
+Некорректное число (`POLL_INTERVAL=abc`) больше не роняет процесс: значение
+заменяется разумным по умолчанию, а ошибка видна в `--check`,
+`--config-show` и в логе (`⚠️ замечания`).
+
+## 🧪 Проверка и тесты
+
+```bash
+pip install -e ".[dev]"
+python -m pytest -q                      # 154 теста: движок, CLI, GUI-мост, настройки
+python -m pytest legacy/tests -q          # 45 тестов legacy-реализации
+python tools/gui_smoke.py                 # собирается ли интерфейс (без запуска окна)
+python -m ruff check autostars tests      # линтер (конфиг в pyproject.toml)
+```
+
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) прогоняет это на
+Python 3.10/3.11/3.12, отдельно — GUI-смоук, legacy и `docker build`.
+Подробности — [docs/TESTING.md](docs/TESTING.md).
+
+## 🔒 Безопасность и риски
+
+Ключи живут только в `.env` (в `.gitignore`); в логах и в GUI они маскируются
+(`abcd…********…wxyz`, `redact()` чистит строки от `golden_key`/`api_key`/токенов
+Telegram), в `--config-show` выводятся только замаскированные значения.
+`maxCharge` не даёт списать больше согласованного, а `Idempotency-Key` — купить
+звёзды дважды при ретрае. Ключ GAMEAU уходит только на `gameau.us`, входящих портов у системы нет.
+
+Автоматизация FunPay — зона риска самого продавца (правила площадки), покупка
+звёзд — реальные деньги: начните с `--test-order --dry-run`, затем 20–50⭐ на
+свой аккаунт. Подробно — [docs/SECURITY.md](docs/SECURITY.md).
+
+## 📚 Документация
+
+| Документ | О чём |
+|---|---|
+| [INSTALL.md](INSTALL.md) | установка на Windows/Linux/Docker, где взять ключи, первый запуск, «частые проблемы» |
+| [FEATURES.md](FEATURES.md) | что умеет и какими параметрами управляется (по модулям) |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | слои, поток данных заказа, схема БД, shutdown, инварианты денег |
+| [docs/SECURITY.md](docs/SECURITY.md) | секреты, права на файлы, маскирование в логах, риски площадки, чек-лист |
+| [docs/TESTING.md](docs/TESTING.md) | как запускать тесты, карта тестов, правила (без сети, без денег) |
+| [docs/WINDOWS_BUILD.md](docs/WINDOWS_BUILD.md) | `install.bat`, `build.bat`, `.exe`, автозапуск, антивирусы |
+| [docs/REFERENCES.md](docs/REFERENCES.md) | референс-проект, версии зависимостей, используемые концы API |
+| [CHANGELOG.md](CHANGELOG.md) · [CONTRIBUTING.md](CONTRIBUTING.md) | история версий; как вносить изменения |
+| [legacy/README.md](legacy/README.md) | почему старый код изолирован и как перенести `db.json` |
 
 ## 📄 Лицензия
 
-MIT — см. [LICENSE](LICENSE).
+MIT — см. [LICENSE](LICENSE). Проект независимый: FunPay и GAMEAU — сторонние
+сервисы, их правила и тарифы меняются без предупреждения.

@@ -12,8 +12,9 @@ v2.1:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .parser import extract_stars_quantity, extract_telegram_username
 from .task_tracker import (
@@ -45,19 +46,19 @@ TRANSIENT_ERRORS = {
 }
 
 
-def _tracker_or_null(tracker: Optional[TaskTracker]) -> TaskTracker:
+def _tracker_or_null(tracker: TaskTracker | None) -> TaskTracker:
     """TaskTracker, а при отсутствии — no-op заглушка (созвимость со старыми вызовами)."""
     if tracker is not None:
         return tracker
 
     class _NullTracker:
-        async def log(self, order_id: str, event: str, detail: str = "") -> None:  # noqa: D105
+        async def log(self, order_id: str, event: str, detail: str = "") -> None:
             logger.debug(f"[TASK {order_id}] {event} {detail}")
 
     return _NullTracker()  # type: ignore[return-value]
 
 
-def _extract_gameau_order_id(result: Dict[str, Any]) -> str:
+def _extract_gameau_order_id(result: dict[str, Any]) -> str:
     """Достаёт ID заказа GAMEAU из ответа (варианты ключей)."""
     data = result.get("data") or {}
     return str(
@@ -69,7 +70,7 @@ def _extract_gameau_order_id(result: Dict[str, Any]) -> str:
     )
 
 
-def _extract_charged_usdt(final: Dict[str, Any], fallback_usdt: float) -> float:
+def _extract_charged_usdt(final: dict[str, Any], fallback_usdt: float) -> float:
     """Фактическая себестоимость в USDT по ответу GAMEAU (chargedAmount/amount/charge)."""
     for key in ("chargedAmount", "amount", "charge"):
         val = final.get(key)
@@ -83,8 +84,51 @@ def _extract_charged_usdt(final: Dict[str, Any], fallback_usdt: float) -> float:
     return fallback_usdt
 
 
+async def _resolve_charge_limit(
+    *,
+    order_data: dict[str, Any],
+    gameau_client: Any,
+    quantity: int,
+    default_limit: float,
+    usdt_per_1000_stars: float,
+    margin_pct: float,
+) -> tuple[float, float, str]:
+    """Возвращает (maxCharge, оценочная себестоимость в USDT, имя пакета).
+
+    maxCharge обязан покрывать реальный пакет: дефолтный лимит рассчитан на
+    1000⭐, и для заказа в 5000⭐ он гарантированно дал бы PRICE_EXCEEDED
+    (то есть не выданную выдачу и спор на FunPay). Поэтому лимит =
+    max(настроенный, цена пакета * (1 + запас)).
+    """
+    fallback_price = round(quantity / 1000.0 * usdt_per_1000_stars, 4)
+    charge_limit = float(order_data.get("max_charge_usdt") or default_limit)
+    package_name = ""
+
+    try:
+        package = await gameau_client.find_stars_package(quantity) if gameau_client else None
+    except Exception as exc:
+        logger.debug(f"[ORDER {order_data.get('id')}] Проверка каталога пропущена: {exc}")
+        package = None
+
+    if package:
+        price = None
+        getter = getattr(gameau_client, "item_price_usdt", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                price = getter(package)
+        if price is None:
+            with contextlib.suppress(TypeError, ValueError):
+                price = float(package.get("price") or 0.0) or None
+        if price:
+            fallback_price = float(price)
+            charge_limit = round(max(charge_limit, float(price) * (1.0 + margin_pct / 100.0)), 2)
+            package_name = str(package.get("name") or package.get("title") or "package")
+
+    return round(charge_limit, 2), round(fallback_price, 4), package_name
+
+
 async def process_paid_order(
-    order_data: Dict[str, Any],
+    order_data: dict[str, Any],
     funpay_client: Any,
     gameau_client: Any,
     db: Any,
@@ -93,11 +137,13 @@ async def process_paid_order(
     max_charge_usdt: float = 9.50,
     whitebird_rate: float = 87.63,
     hide_sender: bool = False,
-    task_tracker: Optional[TaskTracker] = None,
+    task_tracker: TaskTracker | None = None,
     max_order_retries: int = 2,
     wait_completion_timeout: float = 120.0,
     bypass_processed_check: bool = False,
-) -> Dict[str, Any]:
+    usdt_per_1000_stars: float = 9.10,
+    max_charge_margin_pct: float = 5.0,
+) -> dict[str, Any]:
     """
     Обрабатывает оплаченный заказ с FunPay.
 
@@ -170,24 +216,18 @@ async def process_paid_order(
         order_id, EV_PARSED_OK, f"username=@{username}, quantity={quantity}"
     )
 
-    # Проверяем каталог Gameau для уточнения цены пакета, если доступно
-    charge_limit = float(order_data.get("max_charge_usdt") or max_charge_usdt)
-    fallback_price = (quantity / 1000.0) * 9.10  # эталон: 1000 Stars = 9.10 USDT
-    if hasattr(gameau_client, "find_stars_package"):
-        try:
-            package = await gameau_client.find_stars_package(quantity)
-            if package and package.get("price"):
-                cat_price = float(package["price"])
-                # Задаем maxCharge с разумным запасом или по цене каталога
-                charge_limit = round(max(charge_limit, cat_price * 1.05), 2)
-                fallback_price = cat_price
-                await tracker.log(
-                    order_id, EV_PACKAGE_SELECTED,
-                    f"{package.get('name') or package.get('title') or 'package'} "
-                    f"= {cat_price} USDT",
-                )
-        except Exception as exc:
-            logger.debug(f"[ORDER {order_id}] Проверка каталога пропущена: {exc}")
+    # Цена пакета из каталога: по ней считаем и лимит списания, и запасную
+    # себестоимость (когда GAMEAU не вернул chargedAmount).
+    charge_limit, fallback_price, package_name = await _resolve_charge_limit(
+        order_data=order_data,
+        gameau_client=gameau_client,
+        quantity=quantity,
+        default_limit=float(max_charge_usdt),
+        usdt_per_1000_stars=float(usdt_per_1000_stars),
+        margin_pct=float(max_charge_margin_pct),
+    )
+    if package_name:
+        await tracker.log(order_id, EV_PACKAGE_SELECTED, f"{package_name} = {fallback_price} USDT")
 
     # 3. Фиксируем статус 'PROCESSING' в БД
     await db.save_order_status(
@@ -200,7 +240,7 @@ async def process_paid_order(
     )
 
     # 4. Вызываем API Gameau с повторными попытками при сетевых сбоях
-    result: Dict[str, Any] = {}
+    result: dict[str, Any] = {}
     attempts = max(1, int(max_order_retries) + 1)
     for attempt in range(1, attempts + 1):
         result = await gameau_client.buy_telegram_stars(
@@ -245,7 +285,7 @@ async def process_paid_order(
         )
 
         # 5. Ожидаем финальный статус (звёзды реально выданы) — неблокируемо
-        final_data: Dict[str, Any] = result.get("data") or {}
+        final_data: dict[str, Any] = result.get("data") or {}
         waited = False
         if gameau_order_id and hasattr(gameau_client, "wait_for_completion"):
             try:
@@ -453,7 +493,7 @@ async def process_paid_order(
 
 async def _alert_delivery_failed(
     order_id: str,
-    username: Optional[str],
+    username: str | None,
     quantity: int,
     err: str,
     wasted_usdt: float,

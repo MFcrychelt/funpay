@@ -13,20 +13,19 @@ import asyncio
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autostars.database.db_manager import DBManager  # noqa: E402
-from autostars.clients.gameau import GameauClient  # noqa: E402
-from autostars.notifier.tg_alert import TelegramNotifier  # noqa: E402
-from autostars.notifier.tg_commands import TelegramCommandServer  # noqa: E402
-from autostars.services import bot_control  # noqa: E402
-from autostars.services.task_tracker import TaskTracker  # noqa: E402
-from autostars.services.order_processor import process_paid_order  # noqa: E402
+from autostars.clients.gameau import GameauClient
+from autostars.database.db_manager import DBManager
+from autostars.notifier.tg_alert import TelegramNotifier
+from autostars.notifier.tg_commands import TelegramCommandServer
+from autostars.services import bot_control
+from autostars.services.order_processor import process_paid_order
+from autostars.services.task_tracker import TaskTracker
 
 RATE_2 = 87.63
 

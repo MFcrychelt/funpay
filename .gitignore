@@ -1,11 +1,14 @@
 # Секреты и локальные файлы — никогда не коммитить.
 .env
+.env.bak
 config.json
 state.json
 state.broken-*.json
-bot.log
-*.log
+db.json
 *.db
+*.db-shm
+*.db-wal
+*.log
 
 # Python
 __pycache__/
@@ -15,16 +18,23 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 
-# Артефакты
+# Артефакты сборки (PyInstaller)
 build/
 dist/
+*.spec.bak
 
-# Local files
+# Локальные прогоны «как у новичка» (смоук, проверка окружения)
+/ci-home/
+/smoke/
+.autostars-write-test
+
+# Покрытие и отчёты
+.coverage
+htmlcov/
+
+# Локальные процессы/IDE
 .bot.pid
-db.json
-state.json
-autostars.db
-*.log
-AutoStars-New/
-AutoStars-New.zip
+.idea/
+.vscode/

@@ -1,0 +1,29 @@
+{
+  "API": {
+    "url": "https://gameau.us/api/v1",
+    "token": "YOUR_GAMEAU_API_KEY",
+    "ping_url": "https://gameau.us/api/v1/ping",
+    "max_charge_usdt": 9.50,
+    "request_timeout": 30
+  },
+  "BOT": {
+    "enabled": 1,
+    "bot_token": "YOUR_BOT_TOKEN_HERE"
+  },
+  "FUNPAY": {
+    "golden_key": "YOUR_FUNPAY_GOLDEN_KEY"
+  },
+  "FINANCE": {
+    "cost_per_star_usd": 0.017,
+    "revenue_per_star_rub": 1.5,
+    "hide_sender": false
+  },
+  "SETTINGS": {
+    "db_path": "db.json",
+    "request_timeout": 10,
+    "order_check_interval": 10,
+    "admin_telegram_id": null
+  },
+  "rate_variant_1": 110.0,
+  "rate_variant_2": 87.63
+}

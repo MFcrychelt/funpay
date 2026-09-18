@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 from ..database.db_manager import RETRYABLE_STATUSES
 from .order_processor import process_paid_order
@@ -54,6 +54,8 @@ async def process_waiting_username_orders(
     max_order_retries: int = 2,
     wait_completion_timeout: float = 120.0,
     limit: int = 20,
+    usdt_per_1000_stars: float = 9.10,
+    max_charge_margin_pct: float = 5.0,
 ) -> int:
     """
     Проходит по заказам в статусе WAITING_USERNAME и смотрит последнее
@@ -106,6 +108,8 @@ async def process_waiting_username_orders(
                 task_tracker=tracker,
                 max_order_retries=max_order_retries,
                 wait_completion_timeout=wait_completion_timeout,
+                usdt_per_1000_stars=usdt_per_1000_stars,
+                max_charge_margin_pct=max_charge_margin_pct,
                 bypass_processed_check=True,
             )
             started += 1
@@ -131,7 +135,9 @@ async def retry_failed_order(
     hide_sender: bool = False,
     max_order_retries: int = 2,
     wait_completion_timeout: float = 120.0,
-) -> Dict[str, Any]:
+    usdt_per_1000_stars: float = 9.10,
+    max_charge_margin_pct: float = 5.0,
+) -> dict[str, Any]:
     """
     Повторяет выдачу проваленного заказа (FAILED*). Идемпотентно:
     Idempotency-Key детерминирован по order_id, поэтому дубль покупки в GAMEAU
@@ -181,6 +187,8 @@ async def retry_failed_order(
         task_tracker=tracker,
         max_order_retries=max_order_retries,
         wait_completion_timeout=wait_completion_timeout,
+        usdt_per_1000_stars=usdt_per_1000_stars,
+        max_charge_margin_pct=max_charge_margin_pct,
         bypass_processed_check=True,
     )
 
@@ -194,7 +202,7 @@ async def check_gameau_balance(
     tg_notifier: Any,
     threshold_usdt: float = 50.0,
     alert: bool = True,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Проверяет баланс GAMEAU. Если ниже порога — алерт владельцу.
     Возвращает {"balance": float, "currency": str, "plan": str} или None.

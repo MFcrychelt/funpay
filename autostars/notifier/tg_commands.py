@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 
@@ -20,7 +21,7 @@ from .tg_alert import TelegramNotifier
 
 logger = logging.getLogger("autostars.tg_commands")
 
-Handler = Callable[[str], Awaitable[Optional[str]]]
+Handler = Callable[[str], Awaitable[str | None]]
 
 HELP_TEXT = (
     "🤖 <b>AutoStars — управление</b>\n\n"
@@ -33,7 +34,8 @@ HELP_TEXT = (
     "/pause — пауза приёма новых заказов\n"
     "/resume — возобновить выдачу\n"
     "/retry &lt;id заказа&gt; — повторить проваленный заказ\n"
-    "/calc &lt;цена ₽&gt; [звёзды] — калькулятор прибыли\n\n"
+    "/calc &lt;цена ₽&gt; [звёзды] — калькулятор прибыли\n"
+    "/stop — корректно остановить цикл (текущие выдачи дождёмся)\n\n"
     "Пример: /retry 1234567890"
 )
 
@@ -41,10 +43,10 @@ HELP_TEXT = (
 class TelegramCommandServer:
     """Фоновый long-poll обработчик команд владельца в Telegram."""
 
-    def __init__(self, notifier: TelegramNotifier, handlers: Dict[str, Handler]):
+    def __init__(self, notifier: TelegramNotifier, handlers: dict[str, Handler]):
         self.notifier = notifier
         self.handlers = handlers
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def enabled(self) -> bool:
@@ -63,7 +65,7 @@ class TelegramCommandServer:
         args = parts[1].strip() if len(parts) > 1 else ""
         return cmd, args
 
-    async def dispatch(self, text: str) -> Optional[str]:
+    async def dispatch(self, text: str) -> str | None:
         """Возвращает текст ответа на команду (None — молчим)."""
         cmd, args = self.parse_command(text)
         if not cmd:
@@ -77,11 +79,11 @@ class TelegramCommandServer:
             logger.error(f"Ошибка обработчика /{cmd}: {exc}", exc_info=True)
             return f"⚠️ Ошибка при выполнении /{cmd}: {exc}"
 
-    async def _get_updates(self, offset: Optional[int]) -> List[Dict[str, Any]]:
+    async def _get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=65.0)
         url = f"https://api.telegram.org/bot{self.notifier.bot_token}/getUpdates"
-        params: Dict[str, Any] = {
+        params: dict[str, Any] = {
             "timeout": 50,  # long polling — реакции на команды почти мгновенные
             "allowed_updates": '["message"]',
         }
@@ -99,7 +101,7 @@ class TelegramCommandServer:
             logger.info("TG-команды: не настроен (токен/chat_id пуст) — отключено")
             return
 
-        offset: Optional[int] = None
+        offset: int | None = None
         logger.info("TG-команды: сервер запущен (long polling)")
         while not stop_event.is_set():
             try:
@@ -151,8 +153,8 @@ def build_default_handlers(
     notifier: TelegramNotifier,
     stats: Any,
     tracker: Any,
-    loop_controls: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Handler]:
+    loop_controls: dict[str, Any] | None = None,
+) -> dict[str, Handler]:
     """
     Собирает стандартные обработчики команд.
     loop_controls — {"funpay": client, "gameau": client, "notify": notifier,
@@ -161,7 +163,7 @@ def build_default_handlers(
     """
     from ..services import bot_control
 
-    async def h_status(_args: str) -> Optional[str]:
+    async def h_status(_args: str) -> str | None:
         paused = await bot_control.is_bot_paused(db)
         counts = await tracker.summary()
         balance = await bot_control.check_gameau_balance(
@@ -170,7 +172,7 @@ def build_default_handlers(
         lines = [
             "🤖 <b>AUTOSTARS — статус</b>",
             f"{'⏸ В ПАУЗЕ' if paused else '🟢 РАБОТАЕТ'}",
-            f"Задачи: " + (", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "нет"),
+            "Задачи: " + (", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "нет"),
         ]
         if balance:
             lines.append(
@@ -179,7 +181,7 @@ def build_default_handlers(
             )
         return "\n".join(lines)
 
-    async def h_stats(_args: str) -> Optional[str]:
+    async def h_stats(_args: str) -> str | None:
         windows = [
             await stats.window("1 час", 1),
             await stats.day_window(),
@@ -188,7 +190,7 @@ def build_default_handlers(
         ]
         return stats.render_telegram(windows)
 
-    async def h_report(_args: str) -> Optional[str]:
+    async def h_report(_args: str) -> str | None:
         windows = await stats.compute_all()
         import time as _t
 
@@ -206,12 +208,12 @@ def build_default_handlers(
                 )
         return report
 
-    async def h_tasks(_args: str) -> Optional[str]:
+    async def h_tasks(_args: str) -> str | None:
         text = await tracker.render_text(stuck_minutes=cfg.stuck_task_minutes)
         # Убираем рамку для TG
         return text.replace("=", "").replace("-", "").strip()
 
-    async def h_balance(_args: str) -> Optional[str]:
+    async def h_balance(_args: str) -> str | None:
         info = await bot_control.check_gameau_balance(
             gameau_client, notifier, cfg.low_balance_threshold_usdt, alert=True
         )
@@ -224,7 +226,7 @@ def build_default_handlers(
             f"Порог алерта: {cfg.low_balance_threshold_usdt:.2f}"
         )
 
-    async def h_pause(_args: str) -> Optional[str]:
+    async def h_pause(_args: str) -> str | None:
         if loop_controls and "set_paused" in loop_controls:
             await loop_controls["set_paused"](True)
         else:
@@ -232,14 +234,14 @@ def build_default_handlers(
         return "⏸ <b>ПРИЁМ НОВЫХ ЗАКАЗОВ ОСТАНОВЛЕН.</b>\nВ работе уже принятые заказы " \
                "и reconciliation продолжаются. /resume — вернуть в работу."
 
-    async def h_resume(_args: str) -> Optional[str]:
+    async def h_resume(_args: str) -> str | None:
         if loop_controls and "set_paused" in loop_controls:
             await loop_controls["set_paused"](False)
         else:
             await bot_control.set_bot_paused(db, False)
-        return "🟢 <b>ВЫДАЧА ВОЗОБНОВЛЕНА.</b> Новые заказыFunPay снова обрабатываются автоматически."
+        return "🟢 <b>ВЫДАЧА ВОЗОБНОВЛЕНА.</b> Новые заказы FunPay снова обрабатываются автоматически."
 
-    async def h_retry(args: str) -> Optional[str]:
+    async def h_retry(args: str) -> str | None:
         order_id = args.strip()
         if not order_id:
             return "Использование: /retry <id заказа>\nНапример: /retry 1234567890"
@@ -260,6 +262,8 @@ def build_default_handlers(
             hide_sender=cfg.hide_sender,
             max_order_retries=cfg.max_order_retries,
             wait_completion_timeout=cfg.wait_completion_timeout,
+            usdt_per_1000_stars=cfg.usdt_per_1000_stars,
+            max_charge_margin_pct=cfg.max_charge_margin_pct,
         )
         status = res.get("status")
         if status == "completed":
@@ -279,14 +283,21 @@ def build_default_handlers(
             return f"⏳ Заказ #{order_id}: покупателю отправлен запрос @username."
         return f"Результат: {res}"
 
-    async def h_calc(args: str) -> Optional[str]:
+    async def h_stop(_args: str) -> str | None:
+        """Корректная остановка цикла прямо из Telegram (graceful shutdown)."""
+        if not loop_controls or "stop" not in loop_controls:
+            return "⚠️ Остановка из Telegram доступна только в живом цикле (python -m autostars.main)."
+        await loop_controls["stop"]()
+        return "🛑 <b>Останавливаюсь корректно:</b> дождусь текущих выдач и закрою соединения."
+
+    async def h_calc(args: str) -> str | None:
         parts = args.split()
         try:
             price = float(parts[0].replace(",", ".")) if parts else 1370.4
             stars = int(parts[1]) if len(parts) > 1 else 1000
         except (ValueError, IndexError):
             return "Использование: /calc <цена ₽> [звёзды]\nНапример: /calc 1370.40 1000"
-        usdt_cost = round(stars / 1000.0 * 9.10, 2)
+        usdt_cost = round(cfg.estimate_cost_usdt(stars), 4)
         summary = notifier.get_profit_summary(price, usdt_cost)
         return (
             f"🧮 <b>Калькулятор — {stars} Stars</b>\n"
@@ -310,6 +321,7 @@ def build_default_handlers(
         "resume": h_resume,
         "retry": h_retry,
         "calc": h_calc,
+        "stop": h_stop,
     }
 
 

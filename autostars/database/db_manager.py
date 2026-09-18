@@ -11,12 +11,23 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any
+
 import aiosqlite
 
 from .models import ALL_SCHEMAS, MIGRATE_ORDERS_COLUMNS, POST_MIGRATION_SCHEMAS
 
 logger = logging.getLogger("autostars.db")
+
+# WAL — чтобы GUI/CLI читали базу, пока идёт выдача; busy_timeout — чтобы
+# кратковременная блокировка не превращалась в падение задачи.
+PRAGMAS = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA busy_timeout=5000",
+    "PRAGMA foreign_keys=ON",
+)
 
 # Выraжение времени заказа: unix-эпоха (универсальная, не зависит от часового пояса)
 TS_EXPR = "COALESCE(created_ts, CAST(strftime('%s', created_at) AS INTEGER))"
@@ -40,13 +51,29 @@ class DBManager:
 
     def __init__(self, db_path: str = "autostars.db"):
         self.db_path = db_path
-        self._conn: Optional[aiosqlite.Connection] = None
+        self._conn: aiosqlite.Connection | None = None
 
     async def get_connection(self) -> aiosqlite.Connection:
-        """Возвращает активное соединение с базой данных."""
+        """Возвращает активное соединение с базой данных.
+
+        WAL + busy_timeout обязательны: GUI и CLI (`--stats`, `--pause`) читают ту
+        же базу, пока крутится цикл выдачи. Без них параллельный читатель ловит
+        «database is locked», а «locker» на медленном диске — тайм-аут.
+        """
         if self._conn is None:
+            path = Path(self.db_path)
+            if str(path.parent) not in ("", "."):
+                path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(self.db_path)
             self._conn.row_factory = aiosqlite.Row
+            # aiosqlite.Connection — это Thread; без daemon=True «забытое»
+            # close() вьюном-исключением вешает процесс на выходе.
+            self._conn.daemon = True
+            for pragma in PRAGMAS:
+                try:
+                    await self._conn.execute(pragma)
+                except aiosqlite.Error as exc:
+                    logger.debug(f"PRAGMA не применён ({pragma}): {exc}")
         return self._conn
 
     async def _migrate_orders_table(self, conn: aiosqlite.Connection) -> None:
@@ -91,7 +118,7 @@ class DBManager:
         ) as cursor:
             return await cursor.fetchone() is not None
 
-    async def get_order(self, order_id: str) -> Optional[dict[str, Any]]:
+    async def get_order(self, order_id: str) -> dict[str, Any] | None:
         """Получает запись заказа по order_id."""
         conn = await self.get_connection()
         async with conn.execute(
@@ -103,16 +130,16 @@ class DBManager:
     async def save_order_status(
         self,
         order_id: str,
-        username: Optional[str],
+        username: str | None,
         status: str,
-        chat_node: Optional[str] = None,
-        quantity: Optional[int] = None,
-        price_rub: Optional[float] = None,
-        cost_usdt: Optional[float] = None,
-        cost_rub: Optional[float] = None,
-        profit_rub: Optional[float] = None,
-        error: Optional[str] = None,
-        gameau_order_id: Optional[str] = None,
+        chat_node: str | None = None,
+        quantity: int | None = None,
+        price_rub: float | None = None,
+        cost_usdt: float | None = None,
+        cost_rub: float | None = None,
+        profit_rub: float | None = None,
+        error: str | None = None,
+        gameau_order_id: str | None = None,
     ) -> None:
         """Сохраняет или обновляет статус заказа."""
         conn = await self.get_connection()
@@ -240,7 +267,7 @@ class DBManager:
             return [dict(r) for r in rows]
 
     async def get_recent_task_events(self, limit: int = 50,
-                                     hours_back: Optional[float] = None) -> list[dict[str, Any]]:
+                                     hours_back: float | None = None) -> list[dict[str, Any]]:
         """Последние события по всем заказам."""
         conn = await self.get_connection()
         if hours_back is not None:
@@ -280,8 +307,8 @@ class DBManager:
     # Статистика по временным окнам
     # ------------------------------------------------------------------ #
 
-    async def window_stats(self, start_ts: Optional[int] = None,
-                           end_ts: Optional[int] = None) -> dict[str, Any]:
+    async def window_stats(self, start_ts: int | None = None,
+                           end_ts: int | None = None) -> dict[str, Any]:
         """
         Агрегированная статистика по окну времени [start_ts, end_ts) в unix-эпохе.
 
@@ -352,14 +379,14 @@ class DBManager:
         data["avg_profit_rub"] = round(profit_rub / completed, 2) if completed else 0.0
         return data
 
-    async def top_orders(self, limit: int = 5, start_ts: Optional[int] = None,
-                         end_ts: Optional[int] = None, failed_only: bool = False) -> list[dict[str, Any]]:
+    async def top_orders(self, limit: int = 5, start_ts: int | None = None,
+                         end_ts: int | None = None, failed_only: bool = False) -> list[dict[str, Any]]:
         """Топ заказов по прибыли (или проваленные) за окно."""
         conn = await self.get_connection()
         if failed_only:
             query = (
                 "SELECT order_id, username, quantity, price_rub, cost_usdt, status, error "
-                f"FROM orders WHERE status IN ('FAILED','FAILED_LOW_BALANCE','FAILED_PRICE_EXCEEDED','FAILED_DELIVERY','CANCELLED')"
+                "FROM orders WHERE status IN ('FAILED','FAILED_LOW_BALANCE','FAILED_PRICE_EXCEEDED','FAILED_DELIVERY','CANCELLED')"
             )
         else:
             query = (
@@ -384,8 +411,8 @@ class DBManager:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
-    async def get_negative_profit_orders(self, limit: int = 10, start_ts: Optional[int] = None,
-                                         end_ts: Optional[int] = None) -> list[dict[str, Any]]:
+    async def get_negative_profit_orders(self, limit: int = 10, start_ts: int | None = None,
+                                         end_ts: int | None = None) -> list[dict[str, Any]]:
         """Завершённые убыточные сделки (прибыль < 0) за окно."""
         conn = await self.get_connection()
         query = (
@@ -421,7 +448,7 @@ class DBManager:
         conn = await self.get_connection()
         await conn.execute(
             """
-            INSERT OR REPLACE INTO idempotency_logs 
+            INSERT OR REPLACE INTO idempotency_logs
             (idempotency_key, order_id, request_payload, response_payload, status, created_at)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
@@ -436,7 +463,7 @@ class DBManager:
         )
         await conn.commit()
 
-    async def get_idempotency(self, idempotency_key: str) -> Optional[dict[str, Any]]:
+    async def get_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
         """Получает запись о ключе идемпотентности."""
         conn = await self.get_connection()
         async with conn.execute(
@@ -446,7 +473,7 @@ class DBManager:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
         """Получает значение настройки."""
         conn = await self.get_connection()
         async with conn.execute(

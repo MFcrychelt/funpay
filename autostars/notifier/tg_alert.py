@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
+
 import httpx
 
 logger = logging.getLogger("autostars.notifier")
@@ -32,7 +33,7 @@ class TelegramNotifier:
         self.tron_energy_fee_rub = float(tron_energy_fee_rub)
         self.timeout = timeout
         # Персистентный HTTP-клиент (пул соединений) — алерты уходят быстрее
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: httpx.AsyncClient | None = None
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -58,8 +59,8 @@ class TelegramNotifier:
         self,
         order_price_rub: float,
         usdt_cost: float,
-        rate: Optional[float] = None,
-        tron_energy_rub: Optional[float] = None,
+        rate: float | None = None,
+        tron_energy_rub: float | None = None,
     ) -> float:
         """
         Калькуляция чистой прибыли:
@@ -72,7 +73,7 @@ class TelegramNotifier:
         profit_rub = order_price_rub - cost_rub
         return round(profit_rub, 2)
 
-    def get_profit_summary(self, order_price_rub: float, usdt_cost: float) -> Dict[str, Any]:
+    def get_profit_summary(self, order_price_rub: float, usdt_cost: float) -> dict[str, Any]:
         """Возвращает детальную калькуляцию прибыли для обоих вариантов пополнения."""
         profit_v1 = self.calculate_profit(order_price_rub, usdt_cost, rate=self.rate_variant_1)
         profit_v2 = self.calculate_profit(order_price_rub, usdt_cost, rate=self.rate_variant_2)
@@ -148,7 +149,7 @@ class TelegramNotifier:
         order_id: str,
         username: str,
         profit_rub: float = 572.97,
-        order_price_rub: Optional[float] = None,
+        order_price_rub: float | None = None,
         usdt_cost: float = 9.10,
     ) -> bool:
         """

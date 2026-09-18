@@ -1,10 +1,10 @@
-# === ЯДРО (autostars/ — основной движок автовыдачи) ===
-httpx>=0.27.0
-aiosqlite>=0.20.0
-beautifulsoup4>=4.12.0
-
-# === ЛЕГАСЫ-СТАКИ (main.py, bot/, gui.py — исходный AutoStars-New) ===
-FunPayAPI==1.0.4.20
-aiohttp>=3.9.0
-requests>=2.31.0
-flet==0.25.2
+# Ядро AutoStars: python -m autostars.main
+# Ставится одной командой: pip install -r requirements.txt
+#
+# GUI (flet) и инструменты — отдельные extra:
+#   pip install -e ".[gui]"      # настольный интерфейс
+#   pip install -e ".[dev]"      # pytest + ruff + flet
+# Зависимости legacy-кода — в legacy/requirements.txt (он не поддерживается).
+httpx>=0.27,<1
+aiosqlite>=0.20,<1
+beautifulsoup4>=4.12,<5

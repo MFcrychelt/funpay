@@ -15,18 +15,18 @@ import json
 import sys
 import uuid
 from pathlib import Path
-import pytest
+
 import httpx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autostars.config import Config
-from autostars.database.db_manager import DBManager
-from autostars.services.parser import extract_telegram_username, extract_stars_quantity
-from autostars.notifier.tg_alert import TelegramNotifier
-from autostars.clients.gameau import GameauClient
 from autostars.clients.funpay import FunPayClient
+from autostars.clients.gameau import GameauClient
+from autostars.database.db_manager import DBManager
+from autostars.notifier.tg_alert import TelegramNotifier
 from autostars.services.order_processor import process_paid_order
+from autostars.services.parser import extract_stars_quantity, extract_telegram_username
 
 
 # ============================================================================ #
@@ -178,7 +178,6 @@ async def test_gameau_catalog_parsing_and_find_package():
     client = GameauClient("TEST_KEY", base_url="https://gameau.us/api/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(mock_catalog_transport)) as ac:
         # Патчим вызов httpx в клиенте
-        original_get_catalog = client.get_catalog
 
         async def mocked_get_catalog(**kwargs):
             resp = await ac.get("https://gameau.us/api/v1/catalog?type=telegramStars")
@@ -218,7 +217,6 @@ async def test_telegram_alert_sending():
     # Тестируем alert_order_completed с кастомным клиентом
     async with httpx.AsyncClient(transport=httpx.MockTransport(mock_transport)) as client:
         # Патчим метод send_alert для перехвата запросов
-        original_send = notifier.send_alert
 
         async def mocked_send(text, parse_mode="HTML"):
             payload = {"chat_id": notifier.chat_id, "text": text, "parse_mode": parse_mode}
@@ -289,7 +287,7 @@ async def test_gameau_client_price_exceeded_and_low_balance():
     def transport_price_exceeded(request: httpx.Request):
         return httpx.Response(400, text="Price exceeds maxCharge limit")
 
-    client = GameauClient("TEST_API_KEY")
+    GameauClient("TEST_API_KEY")
     async with httpx.AsyncClient(transport=httpx.MockTransport(transport_price_exceeded)) as ac:
         resp = await ac.post("https://gameau.us/api/telegramStars", json={})
         assert resp.status_code == 400 and "maxCharge" in resp.text

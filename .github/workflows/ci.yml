@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: ядро — линт + тесты (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Установка пакета (только зависимости ядра)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Компиляция всех модулей (ловит синтаксические ошибки)
+        run: |
+          python -m compileall -q autostars check_env.py autostars_bot.py autostars_gui.py
+
+      - name: Ruff (линт)
+        run: ruff check autostars tests tools check_env.py autostars_bot.py autostars_gui.py
+
+      - name: Тесты движка (без сети и ключей)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -q
+
+      - name: Смоук CLI в изолированной папке (как у новичка)
+        run: |
+          export AUTOSTARS_HOME="$PWD/ci-home"
+          rm -rf "$AUTOSTARS_HOME"; mkdir -p "$AUTOSTARS_HOME"
+          python -m autostars.main --help > /dev/null
+          # первый запуск: .env создаётся сам из примера
+          python -m autostars.main --config-show > /dev/null
+          test -f "$AUTOSTARS_HOME/.env" && echo "ok: .env создан из примера"
+          sed -i 's/^FUNPAY_GOLDEN_KEY=.*/FUNPAY_GOLDEN_KEY=ci-fake/; s/^GAMEAU_API_KEY=.*/GAMEAU_API_KEY=ci-fake/' "$AUTOSTARS_HOME/.env"
+          python -m autostars.main --calc 1370.4 1000 | grep -q "ПРИБЫЛИ"
+          python -m autostars.main --config-show | grep -q "АКТИВНАЯ КОНФИГУРАЦИЯ"
+          if python -m autostars.main --config-show | grep -q "ci-fake"; then
+            echo "FAIL: --config-show показал секрет целиком"; exit 1
+          fi
+          echo "ok: секреты замаскированы"
+          python -m autostars.main --stats --json | python -c "import json,sys; json.load(sys.stdin)"
+          if python -m autostars.main --test-order tester > /dev/null 2>&1; then
+            echo "FAIL: тестовая выдача ушла без --yes"; exit 1
+          fi
+          echo "ok: --test-order без подтверждения не выполняется"
+          python check_env.py
+
+      - name: Ссылки в документации
+        run: python tools/check_docs_links.py
+
+  gui:
+    name: GUI — импорт flet и смоук интерфейса
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Установка с extra [gui]
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui,dev]"
+      - name: GUI собирается без запуска окна
+        run: python tools/gui_smoke.py
+      - name: pytest (мост и настройки GUI)
+        run: python -m pytest -q tests/test_gui_bridge.py tests/test_gui_settings.py
+
+  legacy:
+    name: legacy — совместимость (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # FunPayAPI пинит старые requests; ставим без зависимостей, как в upstream-инструкции
+      - name: Установка зависимостей legacy
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "requests>=2.31" requests_toolbelt beautifulsoup4
+          python -m pip install --no-deps "FunPayAPI>=1.0.5"
+          python -m pip install pytest anyio
+      - name: Тесты legacy
+        run: python -m pytest -q legacy/tests
+
+  docker:
+    name: Docker — образ собирается
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать образ
+        run: docker build -t autostars-ci .
+      - name: Проверить CLI внутри образа
+        run: docker run --rm autostars-ci --help > /dev/null

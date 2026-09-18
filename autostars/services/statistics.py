@@ -15,13 +15,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any
 
 logger = logging.getLogger("autostars.stats")
 
 # Часовые окна (названия) — по ТЗ: час / 2 / 3 / 4 / 6 / день
-HOUR_WINDOWS: Tuple[Tuple[str, int], ...] = (
+HOUR_WINDOWS: tuple[tuple[str, int], ...] = (
     ("1 час", 1),
     ("2 часа", 2),
     ("3 часа", 3),
@@ -61,7 +61,7 @@ class WindowStats:
     failed_potential_rub: float = 0.0
     avg_profit_rub: float = 0.0
     best_profit_rub: float = 0.0
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def margin_pct(self) -> float:
@@ -72,6 +72,30 @@ class WindowStats:
     @property
     def is_empty(self) -> bool:
         return self.total == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Machine-readable вид (для GUI, `--json` и внешних дашбордов)."""
+        return {
+            "label": self.label,
+            "from_ts": self.from_ts,
+            "to_ts": self.to_ts,
+            "orders_total": self.total,
+            "orders_completed": self.completed,
+            "orders_failed": self.failed,
+            "orders_in_progress": self.in_progress,
+            "orders_waiting_username": self.waiting_username,
+            "stars": self.stars,
+            "revenue_rub": round(self.revenue_rub, 2),
+            "cost_usdt": round(self.cost_usdt, 4),
+            "cost_rub": round(self.cost_rub, 2),
+            "profit_rub": round(self.profit_rub, 2),
+            "margin_pct": self.margin_pct,
+            "avg_profit_rub": round(self.avg_profit_rub, 2),
+            "best_profit_rub": round(self.best_profit_rub, 2),
+            "loss_orders": self.loss_orders,
+            "loss_rub": round(self.loss_rub, 2),
+            "failed_potential_rub": round(self.failed_potential_rub, 2),
+        }
 
 
 class StatisticsService:
@@ -99,7 +123,7 @@ class StatisticsService:
     # Вычисление
     # ------------------------------------------------------------------ #
 
-    def _apply_finance(self, raw: Dict[str, Any], label: str, from_ts: int, to_ts: int) -> WindowStats:
+    def _apply_finance(self, raw: dict[str, Any], label: str, from_ts: int, to_ts: int) -> WindowStats:
         """Дополняет сырые SQL-агрегаты: себестоимость в RUB по активному курсу."""
         cost_rub = float(raw.get("cost_rub") or 0.0)
         # Для старых записей cost_rub мог не заполняться — пересчитываем по курсу
@@ -154,9 +178,9 @@ class StatisticsService:
         now_ts = int(time.time())
         return self._apply_finance(raw, label, 0, now_ts)
 
-    async def compute_all(self) -> List[WindowStats]:
+    async def compute_all(self) -> list[WindowStats]:
         """Полный набор окон: 1ч, 2ч, 3ч, 4ч, 6ч, 24ч, Сегодня, Всего."""
-        result: List[WindowStats] = []
+        result: list[WindowStats] = []
         for label, hours in HOUR_WINDOWS:
             result.append(await self.window(label, hours))
         result.append(await self.today_window())
@@ -167,7 +191,7 @@ class StatisticsService:
     # Отчёты: убытки / прибыль / затраты
     # ------------------------------------------------------------------ #
 
-    async def loss_report(self, hours: float = 24.0) -> Dict[str, Any]:
+    async def loss_report(self, hours: float = 24.0) -> dict[str, Any]:
         """
         Анализ убытков за окно:
         - убыточные сделки (выручка < себестоимость)
@@ -206,9 +230,9 @@ class StatisticsService:
     def _fmt_money(value: float) -> str:
         return f"{value:,.2f}".replace(",", " ")
 
-    def render_text(self, windows: List[WindowStats]) -> str:
+    def render_text(self, windows: list[WindowStats]) -> str:
         """Таблица статистики для консоли."""
-        lines: List[str] = []
+        lines: list[str] = []
         lines.append("=" * 118)
         lines.append(f"{'ОКНО':<16} | {'Заказы':>6} | {'OK':>4} | {'FAIL':>4} | {'В раб.':>6} | "
                      f"{'Звёзды':>8} | {'Выручка ₽':>12} | {'USDT':>8} | {'Затраты ₽':>12} | "
@@ -238,15 +262,31 @@ class StatisticsService:
         )
         return "\n".join(lines)
 
-    def render_telegram(self, windows: List[WindowStats]) -> str:
+    def render_json(self, windows: list[WindowStats]) -> str:
+        """JSON-дамп окон + курсов — стабильный контракт для GUI/внешних инструментов."""
+        import json
+
+        return json.dumps(
+            {
+                "generated_at": int(time.time()),
+                "rate_variant_1": self.rate_variant_1,
+                "rate_variant_2": self.rate_variant_2,
+                "active_variant": self.active_variant,
+                "active_rate": self.active_rate,
+                "windows": [w.to_dict() for w in windows],
+            },
+            ensure_ascii=False,
+        )
+
+    def render_telegram(self, windows: list[WindowStats]) -> str:
         """Компактный HTML-отчёт для Telegram (1ч/24ч/Сегодня/Всего)."""
-        def pick(label: str) -> Optional[WindowStats]:
+        def pick(label: str) -> WindowStats | None:
             for w in windows:
                 if w.label == label:
                     return w
             return None
 
-        blocks: List[str] = []
+        blocks: list[str] = []
         blocks.append("📊 <b>СТАТИСТИКА AUTOSTARS</b>")
         blocks.append(f"Курс: В{self.active_variant} = {self.active_rate:.2f} ₽/USDT")
 
@@ -279,12 +319,12 @@ class StatisticsService:
 
         return "\n".join(blocks)
 
-    def render_full_report(self, windows: List[WindowStats],
-                           top_orders: List[Dict[str, Any]],
-                           failed_orders: List[Dict[str, Any]],
-                           status_counts: Dict[str, int]) -> str:
+    def render_full_report(self, windows: list[WindowStats],
+                           top_orders: list[dict[str, Any]],
+                           failed_orders: list[dict[str, Any]],
+                           status_counts: dict[str, int]) -> str:
         """Развёрнутый ежедневный отчёт: статистика + P&L + убытки + топ + трекинг задач."""
-        parts: List[str] = []
+        parts: list[str] = []
         now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
         parts.append(f"📈 ПОЛНЫЙ ОТЧЁТ AUTOSTARS — {now_str}")
         parts.append("")

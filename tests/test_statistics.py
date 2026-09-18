@@ -13,15 +13,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from autostars.database.db_manager import DBManager  # noqa: E402
-from autostars.services.statistics import StatisticsService  # noqa: E402
-from autostars.services.task_tracker import (  # noqa: E402
+from autostars.database.db_manager import DBManager
+from autostars.services.order_processor import process_paid_order
+from autostars.services.statistics import StatisticsService
+from autostars.services.task_tracker import (
     EV_COMPLETED,
     EV_RECEIVED,
     TaskTracker,
     reconcile_inflight_orders,
 )
-from autostars.services.order_processor import process_paid_order  # noqa: E402
 
 RATE_1 = 110.00
 RATE_2 = 87.63
@@ -72,7 +72,7 @@ def make_stats(db: DBManager) -> StatisticsService:
 @pytest.mark.anyio
 async def test_window_aggregation(tmp_path):
     db = await make_db(tmp_path)
-    now = int(time.time())
+    int(time.time())
 
     # Заказы в разных точках времени:
     # 30м, 1ч50м (COMPLETED), 3ч30м (FAILED), 4ч20м (PROCESSING),

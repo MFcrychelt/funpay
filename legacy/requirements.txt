@@ -1,0 +1,18 @@
+# Зависимости LEGACY-кода (legacy/main.py, legacy/bot/, legacy/gui.py).
+#
+# Эти файлы НЕ поддерживаются: это историческая реализация AutoStars-New,
+# оставленная в репозитории для сравнения и для старых инструкций.
+# Основной движок — пакет autostars/ (его зависимости в requirements.txt).
+#
+# Установка (FunPayAPI ставится без зависимостей намеренно: он пинит
+# requests==2.28.x, что конфликтует с актуальными версиями):
+#
+#     pip install -r legacy/requirements.txt
+#     pip install --no-deps "FunPayAPI>=1.0.5"
+#
+# Запуск старого CLI:  python legacy/main.py
+# Старый GUI (flet):   python legacy/gui.py
+requests>=2.31
+aiohttp>=3.9
+beautifulsoup4>=4.12
+lxml>=5.0
