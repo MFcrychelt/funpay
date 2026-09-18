@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
+
 import httpx
 
 logger = logging.getLogger("autostars.notifier")
@@ -22,6 +23,7 @@ class TelegramNotifier:
         active_variant: int = 2,
         tron_energy_fee_rub: float = 0.0,
         timeout: float = 10.0,
+        mute_window: tuple[int, int] | None = None,
     ):
         self.bot_token = bot_token.strip()
         self.chat_id = str(chat_id).strip()
@@ -31,8 +33,10 @@ class TelegramNotifier:
         self.active_variant = active_variant
         self.tron_energy_fee_rub = float(tron_energy_fee_rub)
         self.timeout = timeout
+        # «Тихие часы» (напр. (23, 7)): некритичные алерты молчат, ошибки — нет.
+        self.mute_window = mute_window
         # Персистентный HTTP-клиент (пул соединений) — алерты уходят быстрее
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: httpx.AsyncClient | None = None
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -58,8 +62,8 @@ class TelegramNotifier:
         self,
         order_price_rub: float,
         usdt_cost: float,
-        rate: Optional[float] = None,
-        tron_energy_rub: Optional[float] = None,
+        rate: float | None = None,
+        tron_energy_rub: float | None = None,
     ) -> float:
         """
         Калькуляция чистой прибыли:
@@ -72,7 +76,7 @@ class TelegramNotifier:
         profit_rub = order_price_rub - cost_rub
         return round(profit_rub, 2)
 
-    def get_profit_summary(self, order_price_rub: float, usdt_cost: float) -> Dict[str, Any]:
+    def get_profit_summary(self, order_price_rub: float, usdt_cost: float) -> dict[str, Any]:
         """Возвращает детальную калькуляцию прибыли для обоих вариантов пополнения."""
         profit_v1 = self.calculate_profit(order_price_rub, usdt_cost, rate=self.rate_variant_1)
         profit_v2 = self.calculate_profit(order_price_rub, usdt_cost, rate=self.rate_variant_2)
@@ -93,8 +97,26 @@ class TelegramNotifier:
             "active_profit_rub": profit_v1 if self.active_variant == 1 else profit_v2,
         }
 
-    async def send_alert(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Отправляет текстовое сообщение в Telegram владельцу."""
+    def is_muted(self, moment: float | None = None) -> bool:
+        """Сейчас «тихие часы»?(окно может переходить через полночь: 23 → 7)"""
+        if not self.mute_window:
+            return False
+        import time as _time
+
+        start, end = self.mute_window
+        hour = _time.localtime(moment if moment is not None else _time.time()).tm_hour
+        return hour >= start or hour < end if start > end else start <= hour < end
+
+    async def send_alert(self, text: str, parse_mode: str = "HTML", *, critical: bool = True) -> bool:
+        """Отправляет текстовое сообщение в Telegram владельцу.
+
+        `critical=False` — informational (успешная сделка, плановая статистика):
+        такие сообщения подавляются в «тихие часы». Всё, что требует действий,
+        уходит всегда.
+        """
+        if not critical and self.is_muted():
+            logger.info(f"[TG] тихие часы — некритичный алерт отложен: {text[:80]}…")
+            return False
         if not self.is_configured:
             logger.info(f"[TG Alert (не настроен)]: {text}")
             return False
@@ -118,7 +140,7 @@ class TelegramNotifier:
             logger.error(f"Не удалось отправить уведомление в Telegram: {exc}")
             return False
 
-    async def send_stats_report(self, text: str, parse_mode: str = "HTML") -> bool:
+    async def send_stats_report(self, text: str, parse_mode: str = "HTML", *, critical: bool = False) -> bool:
         """
         Отправляет развёрнутый статистический отчёт (1ч/2ч/3ч/4ч/6ч/день).
         Делит длинный текст на части (лимит Telegram — 4096 символов).
@@ -140,7 +162,7 @@ class TelegramNotifier:
         ok = True
         for i, chunk in enumerate(chunks, 1):
             suffix = f"\n\n— часть {i}/{len(chunks)}" if len(chunks) > 1 else ""
-            ok = await self.send_alert(chunk + suffix, parse_mode=parse_mode) and ok
+            ok = await self.send_alert(chunk + suffix, parse_mode=parse_mode, critical=critical) and ok
         return ok
 
     async def alert_order_completed(
@@ -148,7 +170,7 @@ class TelegramNotifier:
         order_id: str,
         username: str,
         profit_rub: float = 572.97,
-        order_price_rub: Optional[float] = None,
+        order_price_rub: float | None = None,
         usdt_cost: float = 9.10,
     ) -> bool:
         """
@@ -166,7 +188,7 @@ class TelegramNotifier:
         else:
             msg = f"💰 Заказ #{order_id} выполнен! +{profit_rub:.2f} RUB чистой прибыли (Отправлено @{username})"
 
-        return await self.send_alert(msg)
+        return await self.send_alert(msg, critical=False)
 
     async def alert_low_balance(self, order_id: str) -> bool:
         """Критический алерт о низком балансе Gameau с инструкциями по обоим вариантам."""

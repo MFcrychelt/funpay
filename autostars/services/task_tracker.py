@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
-
-from ..database.db_manager import IN_PROGRESS_STATUSES
+from typing import Any
 
 logger = logging.getLogger("autostars.tasks")
 
@@ -27,6 +25,8 @@ EV_STUCK_ALERTED = "STUCK_ALERTED"       # разовый алерт о зави
 EV_COMPLETED = "COMPLETED"               # задача закрыта успешно
 EV_FAILED = "FAILED"                     # задача закрыта с ошибкой
 EV_CANCELLED = "CANCELLED"               # заказ отменён
+EV_RISK_HOLD = "RISK_HOLD"               # заказ задержан политикой выдачи (ждёт человека)
+EV_RISK_ALERT = "RISK_ALERT"             # политика сработала, но выдача продолжилась
 
 
 class TaskTracker:
@@ -43,25 +43,29 @@ class TaskTracker:
         except Exception as exc:  # трекер не должен ронять пайплайн
             logger.warning(f"Не удалось записать событие {event} по {order_id}: {exc}")
 
-    async def timeline(self, order_id: str) -> List[Dict[str, Any]]:
+    async def held_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Заказы, задержанные политикой выдачи и ждущие решения человека."""
+        return await self.db.get_orders_by_status(("HOLD_MANUAL",), limit=limit)
+
+    async def timeline(self, order_id: str) -> list[dict[str, Any]]:
         """Полная история выполнения задачи по заказу."""
         return await self.db.get_task_timeline(order_id)
 
-    async def summary(self) -> Dict[str, int]:
+    async def summary(self) -> dict[str, int]:
         """Счётчики по статусам (сводный трекинг)."""
         return await self.db.get_status_counts()
 
-    async def open_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def open_tasks(self, limit: int = 50) -> list[dict[str, Any]]:
         """Открытые задачи (в работе)."""
         return await self.db.get_in_progress_orders(limit=limit)
 
-    async def stuck_tasks(self, stuck_minutes: float = 20.0) -> List[Dict[str, Any]]:
+    async def stuck_tasks(self, stuck_minutes: float = 20.0) -> list[dict[str, Any]]:
         """Зависшие задачи: в работе, но без обновлений дольше stuck_minutes."""
         return await self.db.get_stuck_orders(stuck_seconds=int(stuck_minutes * 60))
 
     async def render_text(self, stuck_minutes: float = 20.0) -> str:
         """Текстовая сводка трекинга для консоли."""
-        lines: List[str] = []
+        lines: list[str] = []
         now = time.time()
         lines.append("=" * 80)
         lines.append("🗂 ТРЕКИНГ ВЫПОЛНЕНИЯ ЗАДАЧ")
@@ -128,7 +132,8 @@ async def reconcile_inflight_orders(
         quantity = int(order.get("quantity") or 0)
         price_rub = float(order.get("price_rub") or 0.0)
 
-        if order_id in stuck_ids:
+        # вложенность осознанна: второй запрос к базе только для зависших заказов
+        if order_id in stuck_ids:  # noqa: SIM102
             if not await db.has_recent_task_event(order_id, EV_STUCK_ALERTED, minutes_back=60):
                 await tracker.log(order_id, EV_STUCK_ALERTED, f"нет движения {int(stuck_minutes)}+ мин")
                 try:
@@ -154,7 +159,7 @@ async def reconcile_inflight_orders(
         if status in ("", "processing", "unknown"):
             continue
 
-        from ..clients.gameau import SUCCESS_STATUSES, FAILED_STATUSES
+        from ..clients.gameau import FAILED_STATUSES, SUCCESS_STATUSES
 
         if status in SUCCESS_STATUSES:
             # Доп. расчёт: себестоимость по фактическому списанию

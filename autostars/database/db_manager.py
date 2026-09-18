@@ -11,14 +11,26 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Optional
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
 import aiosqlite
 
 from .models import ALL_SCHEMAS, MIGRATE_ORDERS_COLUMNS, POST_MIGRATION_SCHEMAS
 
 logger = logging.getLogger("autostars.db")
 
-# Выraжение времени заказа: unix-эпоха (универсальная, не зависит от часового пояса)
+# WAL — чтобы GUI/CLI читали базу, пока идёт выдача; busy_timeout — чтобы
+# кратковременная блокировка не превращалась в падение задачи.
+PRAGMAS = (
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA busy_timeout=5000",
+    "PRAGMA foreign_keys=ON",
+)
+
+# Выражение времени заказа: unix-эпоха (универсальная, не зависит от часового пояса)
 TS_EXPR = "COALESCE(created_ts, CAST(strftime('%s', created_at) AS INTEGER))"
 UPDATED_TS_EXPR = "COALESCE(updated_ts, CAST(strftime('%s', updated_at) AS INTEGER))"
 
@@ -31,8 +43,12 @@ TERMINAL_FAIL_STATUSES = (
     "FAILED_DELIVERY",
     "CANCELLED",
 )
-# Статусы, при которых допустим ручной ретрай заказа
-RETRYABLE_STATUSES = TERMINAL_FAIL_STATUSES
+# Задержанные политикой выдачи: это не провал и не «в работе» — заказ ждёт решения
+# человека (`--release`/`/release`). В IN_PROGRESS_STATUSES его брать нельзя:
+# иначе reconciliation каждые 20 минут будут кричать «задача зависла».
+HOLD_STATUSES = ("HOLD_MANUAL",)
+# Статусы, при которых допустима ручная выдача/ретрай: провалы + задержанные
+RETRYABLE_STATUSES = HOLD_STATUSES + TERMINAL_FAIL_STATUSES
 
 
 class DBManager:
@@ -40,13 +56,29 @@ class DBManager:
 
     def __init__(self, db_path: str = "autostars.db"):
         self.db_path = db_path
-        self._conn: Optional[aiosqlite.Connection] = None
+        self._conn: aiosqlite.Connection | None = None
 
     async def get_connection(self) -> aiosqlite.Connection:
-        """Возвращает активное соединение с базой данных."""
+        """Возвращает активное соединение с базой данных.
+
+        WAL + busy_timeout обязательны: GUI и CLI (`--stats`, `--pause`) читают ту
+        же базу, пока крутится цикл выдачи. Без них параллельный читатель ловит
+        «database is locked», а «locker» на медленном диске — тайм-аут.
+        """
         if self._conn is None:
+            path = Path(self.db_path)
+            if str(path.parent) not in ("", "."):
+                path.parent.mkdir(parents=True, exist_ok=True)
             self._conn = await aiosqlite.connect(self.db_path)
             self._conn.row_factory = aiosqlite.Row
+            # aiosqlite.Connection — это Thread; без daemon=True «забытое»
+            # close() вьюном-исключением вешает процесс на выходе.
+            self._conn.daemon = True
+            for pragma in PRAGMAS:
+                try:
+                    await self._conn.execute(pragma)
+                except aiosqlite.Error as exc:
+                    logger.debug(f"PRAGMA не применён ({pragma}): {exc}")
         return self._conn
 
     async def _migrate_orders_table(self, conn: aiosqlite.Connection) -> None:
@@ -91,7 +123,7 @@ class DBManager:
         ) as cursor:
             return await cursor.fetchone() is not None
 
-    async def get_order(self, order_id: str) -> Optional[dict[str, Any]]:
+    async def get_order(self, order_id: str) -> dict[str, Any] | None:
         """Получает запись заказа по order_id."""
         conn = await self.get_connection()
         async with conn.execute(
@@ -103,16 +135,16 @@ class DBManager:
     async def save_order_status(
         self,
         order_id: str,
-        username: Optional[str],
+        username: str | None,
         status: str,
-        chat_node: Optional[str] = None,
-        quantity: Optional[int] = None,
-        price_rub: Optional[float] = None,
-        cost_usdt: Optional[float] = None,
-        cost_rub: Optional[float] = None,
-        profit_rub: Optional[float] = None,
-        error: Optional[str] = None,
-        gameau_order_id: Optional[str] = None,
+        chat_node: str | None = None,
+        quantity: int | None = None,
+        price_rub: float | None = None,
+        cost_usdt: float | None = None,
+        cost_rub: float | None = None,
+        profit_rub: float | None = None,
+        error: str | None = None,
+        gameau_order_id: str | None = None,
     ) -> None:
         """Сохраняет или обновляет статус заказа."""
         conn = await self.get_connection()
@@ -240,7 +272,7 @@ class DBManager:
             return [dict(r) for r in rows]
 
     async def get_recent_task_events(self, limit: int = 50,
-                                     hours_back: Optional[float] = None) -> list[dict[str, Any]]:
+                                     hours_back: float | None = None) -> list[dict[str, Any]]:
         """Последние события по всем заказам."""
         conn = await self.get_connection()
         if hours_back is not None:
@@ -280,8 +312,8 @@ class DBManager:
     # Статистика по временным окнам
     # ------------------------------------------------------------------ #
 
-    async def window_stats(self, start_ts: Optional[int] = None,
-                           end_ts: Optional[int] = None) -> dict[str, Any]:
+    async def window_stats(self, start_ts: int | None = None,
+                           end_ts: int | None = None) -> dict[str, Any]:
         """
         Агрегированная статистика по окну времени [start_ts, end_ts) в unix-эпохе.
 
@@ -315,6 +347,7 @@ class DBManager:
                               THEN 1 ELSE 0 END), 0) AS failed,
             COALESCE(SUM(CASE WHEN status IN ('PROCESSING','WAITING_USERNAME') THEN 1 ELSE 0 END), 0) AS in_progress,
             COALESCE(SUM(CASE WHEN status = 'WAITING_USERNAME' THEN 1 ELSE 0 END), 0) AS waiting_username,
+            COALESCE(SUM(CASE WHEN status = 'HOLD_MANUAL' THEN 1 ELSE 0 END), 0) AS held,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN quantity ELSE 0 END), 0) AS stars,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN price_rub ELSE 0 END), 0.0) AS revenue_rub,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN cost_usdt ELSE 0 END), 0.0) AS cost_usdt,
@@ -352,14 +385,14 @@ class DBManager:
         data["avg_profit_rub"] = round(profit_rub / completed, 2) if completed else 0.0
         return data
 
-    async def top_orders(self, limit: int = 5, start_ts: Optional[int] = None,
-                         end_ts: Optional[int] = None, failed_only: bool = False) -> list[dict[str, Any]]:
+    async def top_orders(self, limit: int = 5, start_ts: int | None = None,
+                         end_ts: int | None = None, failed_only: bool = False) -> list[dict[str, Any]]:
         """Топ заказов по прибыли (или проваленные) за окно."""
         conn = await self.get_connection()
         if failed_only:
             query = (
                 "SELECT order_id, username, quantity, price_rub, cost_usdt, status, error "
-                f"FROM orders WHERE status IN ('FAILED','FAILED_LOW_BALANCE','FAILED_PRICE_EXCEEDED','FAILED_DELIVERY','CANCELLED')"
+                "FROM orders WHERE status IN ('FAILED','FAILED_LOW_BALANCE','FAILED_PRICE_EXCEEDED','FAILED_DELIVERY','CANCELLED')"
             )
         else:
             query = (
@@ -384,8 +417,8 @@ class DBManager:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
-    async def get_negative_profit_orders(self, limit: int = 10, start_ts: Optional[int] = None,
-                                         end_ts: Optional[int] = None) -> list[dict[str, Any]]:
+    async def get_negative_profit_orders(self, limit: int = 10, start_ts: int | None = None,
+                                         end_ts: int | None = None) -> list[dict[str, Any]]:
         """Завершённые убыточные сделки (прибыль < 0) за окно."""
         conn = await self.get_connection()
         query = (
@@ -421,7 +454,7 @@ class DBManager:
         conn = await self.get_connection()
         await conn.execute(
             """
-            INSERT OR REPLACE INTO idempotency_logs 
+            INSERT OR REPLACE INTO idempotency_logs
             (idempotency_key, order_id, request_payload, response_payload, status, created_at)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
@@ -436,7 +469,7 @@ class DBManager:
         )
         await conn.commit()
 
-    async def get_idempotency(self, idempotency_key: str) -> Optional[dict[str, Any]]:
+    async def get_idempotency(self, idempotency_key: str) -> dict[str, Any] | None:
         """Получает запись о ключе идемпотентности."""
         conn = await self.get_connection()
         async with conn.execute(
@@ -446,7 +479,154 @@ class DBManager:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    # ------------------------------------------------------------------ #
+    # Риск-менеджмент: лимиты, дубликаты, флаги покупателей
+    # ------------------------------------------------------------------ #
+    async def sum_cost_usdt_since(self, since_ts: int) -> float:
+        """Сумма списаний (USDT) по заказам с `since_ts` — для суточного лимита.
+
+        Учитываются все статусы, кроме отменённых: деньги уже ушли, и «вернуть»
+        их статистика не может.
+        """
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT COALESCE(SUM(cost_usdt), 0) FROM orders "
+            "WHERE status <> 'CANCELLED' AND COALESCE(updated_ts, created_ts, 0) >= ?",
+            (int(since_ts),),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    async def find_recent_order_by_username(
+        self, username: str, quantity: int | None = None, *, since_ts: int, exclude_order_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Последний заказ того же покупателя (окно `since_ts`) — признак дубля."""
+        conn = await self.get_connection()
+        # в orders.username движок хранит ник без '@', но пользователи (и старые
+        # версии БД) пишут его по-разному → сравниваем нормализованное значение
+        query = (
+            "SELECT order_id, status, quantity, price_rub, created_ts FROM orders "
+            "WHERE REPLACE(LOWER(COALESCE(username, '')), '@', '') = ?"
+            " AND COALESCE(created_ts, 0) >= ?"
+        )
+        params: list[Any] = [str(username).lstrip("@").lower(), int(since_ts)]
+        if quantity is not None:
+            query += " AND quantity = ?"
+            params.append(int(quantity))
+        if exclude_order_id:
+            query += " AND order_id <> ?"
+            params.append(str(exclude_order_id))
+        query += " ORDER BY created_ts DESC LIMIT 1"
+        async with conn.execute(query, tuple(params)) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def add_buyer_flag(self, username: str, kind: str = "blacklist", note: str | None = None) -> None:
+        """Ставит флаг покупателю (по умолчанию — в чёрный список)."""
+        conn = await self.get_connection()
+        await conn.execute(
+            "INSERT INTO buyer_flags (username, kind, note, created_ts) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET kind = excluded.kind, note = excluded.note, "
+            "created_ts = excluded.created_ts",
+            (f"@{username.lstrip('@')}", kind, note, int(time.time())),
+        )
+        await conn.commit()
+
+    async def remove_buyer_flag(self, username: str, kind: str | None = None) -> int:
+        conn = await self.get_connection()
+        target = f"@{username.lstrip('@')}"
+        if kind:
+            cursor = await conn.execute("DELETE FROM buyer_flags WHERE username = ? AND kind = ?", (target, kind))
+        else:
+            cursor = await conn.execute("DELETE FROM buyer_flags WHERE username = ?", (target,))
+        await conn.commit()
+        return cursor.rowcount or 0
+
+    async def list_buyer_flags(self, kind: str | None = None) -> list[dict[str, Any]]:
+        conn = await self.get_connection()
+        if kind:
+            cursor = await conn.execute(
+                "SELECT username, kind, note, created_ts FROM buyer_flags WHERE kind = ? ORDER BY created_ts DESC",
+                (kind,),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT username, kind, note, created_ts FROM buyer_flags ORDER BY created_ts DESC"
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def is_buyer_flagged(self, username: str, kind: str = "blacklist") -> bool:
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT 1 FROM buyer_flags WHERE username = ? AND kind = ? LIMIT 1",
+            (f"@{username.lstrip('@')}", kind),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def buyer_stats(self, since_ts: int, limit: int = 20) -> list[dict[str, Any]]:
+        """Сводка по покупателям за период: оборот, средняя маржа, провалы."""
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT username,"
+            " COUNT(*) AS orders,"
+            " SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed,"
+            " SUM(CASE WHEN status LIKE 'FAILED%' THEN 1 ELSE 0 END) AS failed,"
+            " COALESCE(SUM(quantity), 0) AS stars,"
+            " COALESCE(SUM(price_rub), 0.0) AS revenue_rub,"
+            " COALESCE(SUM(cost_rub), 0.0) AS cost_rub,"
+            " COALESCE(SUM(profit_rub), 0.0) AS profit_rub,"
+            " MAX(COALESCE(updated_ts, created_ts, 0)) AS last_ts"
+            " FROM orders WHERE username IS NOT NULL AND COALESCE(created_ts, 0) >= ?"
+            " GROUP BY username ORDER BY revenue_rub DESC LIMIT ?",
+            (int(since_ts), int(limit)),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def select_orders(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        statuses: Sequence[str] | None = None,
+        username: str | None = None,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Произвольная выборка заказов для выгрузки/отчётов (без бизнес-правил).
+
+        `since`/`until` — строки `YYYY-MM-DD HH:MM:SS` (UTC), сравниваются с
+        `created_at`. Возвращает dict'ы в порядке убывания даты создания.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if since:
+            where.append("COALESCE(created_at, '') >= ?")
+            params.append(since)
+        if until:
+            where.append("COALESCE(created_at, '') <= ?")
+            params.append(until)
+        if statuses:
+            wanted = [str(s) for s in statuses if str(s).strip()]
+            if wanted:
+                where.append(f"status IN ({','.join('?' * len(wanted))})")
+                params.extend(wanted)
+        if username:
+            where.append("REPLACE(LOWER(COALESCE(username, '')), '@', '') = ?")
+            params.append(str(username).lstrip("@").lower())
+        sql = "SELECT * FROM orders"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {TS_EXPR} DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        conn = await self.get_connection()
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
         """Получает значение настройки."""
         conn = await self.get_connection()
         async with conn.execute(

@@ -1,22 +1,67 @@
-"""Клиент B2B API Gameau (https://gameau.us/api-docs.html) с поддержкой каталога, Idempotency-Key и maxCharge."""
+"""Клиент B2B API GAMEAU (https://gameau.us/api-docs.html).
+
+Каталог, заказы telegramStars, статусы, баланс. Ключевые свойства:
+  • `Idempotency-Key` = детерминированный UUID v5 от ID заказа FunPay —
+    ретрай не создаёт вторую покупку;
+  • `maxCharge` — лимит списания на заказ (защита от «списали весь баланс»);
+  • каталог кешируется (по типу товара) и используется для расчёта
+    фактической себестоимости вместо захардкоженной «9.10 USDT за 1000⭐»;
+  • 429/502/503/504 повторяются с backoff и учётом `Retry-After`;
+  • персистентный httpx.AsyncClient (пул соединений, без TLS-хендшейка на запрос);
+  • секреты и простыни HTML/JSON в лог не пишутся (см. `autostars.security`).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import random
 import re
+import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 import httpx
+
+from ..security import redact, truncate
 
 logger = logging.getLogger("GameauClient")
 
 SUCCESS_STATUSES = {"success", "completed", "complete", "delivered", "paid"}
 FAILED_STATUSES = {"failed", "refunded", "cancelled", "canceled", "rejected", "error"}
+RETRYABLE_STATUS_CODES = (429, 502, 503, 504)
+
+# себестоимость «по умолчанию», когда каталог недоступен (1000 звёзд)
+FALLBACK_USDT_PER_1000_STARS = 9.10
+
+
+class GameauError(RuntimeError):
+    """Ошибка GAMEAU с текстом, понятным человеку, а не только стектрейсу."""
+
+    def __init__(self, message: str, *, code: str = "", status_code: int = 0) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+def parse_balance_usdt(account: dict[str, Any] | None) -> float | None:
+    """Достаёт баланс USDT из ответа /account (нормализуя варианты ключей)."""
+    if not account:
+        return None
+    for key in ("balance", "balanceUsdt", "balance_usdt", "amount", "usdt"):
+        value = account.get(key)
+        if value is None:
+            continue
+        try:
+            return float(str(value).replace("\u00a0", "").replace(" ", ""))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 class GameauClient:
-    """Асинхронный клиент для взаимодействия с Gameau B2B API v1."""
+    """Асинхронный клиент GAMEAU REST API v1."""
 
     def __init__(
         self,
@@ -24,133 +69,181 @@ class GameauClient:
         base_url: str = "https://gameau.us/api/v1",
         max_retries: int = 3,
         timeout: float = 20.0,
-    ):
-        self.api_key = api_key
-        # Нормализация URL: если передан /api без /v1, проверяем совместимость
-        self.base_url = base_url.rstrip("/")
+        cache_ttl: float = 60.0,
+    ) -> None:
+        self.api_key = (api_key or "").strip()
+        self.base_url = (base_url or "").rstrip("/")
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        self.max_retries = max_retries
+        self.max_retries = max(1, int(max_retries))
         self.timeout = timeout
-        self._catalog_cache: Optional[tuple[float, list[dict[str, Any]]]] = None
-        # Персистентный клиент: переиспользование соединений (без TLS-хендшейка
-        # на каждый запрос) — быстрее реагирование на новые заказы.
-        self._client: Optional[httpx.AsyncClient] = None
+        self.cache_ttl = cache_ttl
+        self._catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._client: httpx.AsyncClient | None = None
+        self._secrets: tuple[str, ...] = tuple(s for s in (self.api_key,) if s)
 
+    # ------------------------------------------------------------------ #
+    # транспорт
+    # ------------------------------------------------------------------ #
     async def _http(self) -> httpx.AsyncClient:
-        """Лениво создаёт и переиспользует httpx.AsyncClient с пулом соединений."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
     async def close(self) -> None:
-        """Закрывает соединение (вызывается при остановке бота)."""
         if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
+            with contextlib.suppress(Exception):
+                await self._client.aclose()
         self._client = None
 
-    def _get_idempotency_key(self, order_id: str) -> str:
-        """Генерирует детерминированный UUID v5 для заказа FunPay."""
+    def _idempotency_key(self, order_id: str) -> str:
+        """UUID v5 от ID заказа FunPay: одинаковый для одинакового заказа."""
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"funpay_{order_id}"))
 
+    def _candidate_urls(self, path: str) -> list[str]:
+        """Пробуем и v1-префикс, и «голый» путь — API мигрировал между схемами."""
+        urls = [f"{self.base_url}/{path.lstrip('/')}"]
+        if "/v1" not in self.base_url:
+            urls.append(f"{self.base_url}/v1/{path.lstrip('/')}")
+        else:
+            urls.append(f"{self.base_url.replace('/v1', '')}/{path.lstrip('/')}")
+        # нормализуем возможные двойные слеши
+        return [re.sub(r"(?<!:)//+", "/", url) for url in dict.fromkeys(urls)]
+
+    @staticmethod
+    def _retry_after(response: httpx.Response, default: float) -> float:
+        value = response.headers.get("Retry-After")
+        if not value:
+            return default
+        try:
+            return max(1.0, min(float(value), 120.0))
+        except ValueError:
+            return default
+
+    # ------------------------------------------------------------------ #
+    # каталог
+    # ------------------------------------------------------------------ #
     async def get_catalog(
         self,
         item_type: str = "telegramStars",
         limit: int = 100,
-        ttl: float = 60.0,
-    ) -> List[Dict[str, Any]]:
-        """
-        Получает каталог товаров с Gameau API (GET /catalog?type=telegramStars).
-        Результаты кешируются на ttl секунд.
-        """
-        import time
-
+        ttl: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Каталог товаров (GET /catalog?type=...), с кешем на `ttl` секунд."""
+        ttl = self.cache_ttl if ttl is None else ttl
         now = time.time()
-        if self._catalog_cache and (now - self._catalog_cache[0]) < ttl:
-            return self._catalog_cache[1]
+        cached = self._catalog_cache.get(item_type)
+        if cached and (now - cached[0]) < ttl:
+            return cached[1]
 
-        url = f"{self.base_url}/catalog"
         params = {"type": item_type, "limit": limit}
-
         client = await self._http()
-        try:
-            response = await client.get(url, params=params, headers=self.headers)
-            if response.status_code == 404 and "/v1" in self.base_url:
-                # Попытка фоллбэка без /v1
-                fallback_url = self.base_url.replace("/v1", "") + "/catalog"
-                response = await client.get(fallback_url, params=params, headers=self.headers)
-
+        last_status = 0
+        for url in self._candidate_urls("catalog"):
+            try:
+                response = await client.get(url, params=params, headers=self.headers)
+            except httpx.RequestError as exc:
+                logger.error(f"Сетевой сбой при запросе каталога ({url}): {exc}")
+                return cached[1] if cached else []
             if response.status_code == 200:
-                data = response.json()
-                items = []
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    cat = data.get("catalog") or {}
-                    items = cat.get("items") or data.get("items") or []
-
-                self._catalog_cache = (now, items)
-                logger.debug(f"Загружен каталог Gameau: {len(items)} позиций типа {item_type}")
+                items = self._extract_catalog_items(response.json())
+                self._catalog_cache[item_type] = (now, items)
+                logger.debug(f"Каталог GAMEAU: {len(items)} позиций типа {item_type}")
                 return items
-            else:
-                logger.warning(f"Ошибка загрузки каталога Gameau: {response.status_code} - {response.text}")
-                return []
-        except Exception as exc:
-            logger.error(f"Сетевой сбой при запросе каталога: {exc}")
-            return []
+            last_status = response.status_code
+            continue
+
+        logger.warning(
+            f"Не удалось загрузить каталог GAMEAU (HTTP {last_status or 'нет ответа'}) — "
+            f"будет использована оценочная себестоимость"
+        )
+        return cached[1] if cached else []
 
     @staticmethod
-    def extract_item_stars(item: Dict[str, Any]) -> Optional[int]:
-        """Извлекает количество звёзд из элемента каталога."""
+    def _extract_catalog_items(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            cat = data.get("catalog") or {}
+            if isinstance(cat, dict):
+                return cat.get("items") or []
+            return data.get("items") or []
+        return []
+
+    @staticmethod
+    def extract_item_stars(item: dict[str, Any]) -> int | None:
+        """Сколько звёзд в пакете: явные поля, иначе — цифры из названия."""
         order_info = item.get("order") or {}
-        body = order_info.get("body") or {}
+        body = order_info.get("body") or {} if isinstance(order_info, dict) else {}
         for key in ("quantity", "stars", "amount"):
-            val = body.get(key) or item.get(key)
+            val = body.get(key) if isinstance(body, dict) else None
+            val = val if val is not None else item.get(key)
             if isinstance(val, (int, float)) and val > 0:
                 return int(val)
 
-        name = item.get("name") or item.get("title") or ""
-        match = re.search(r"(\d[\d\s]*)", str(name))
+        name = str(item.get("name") or item.get("title") or "")
+        match = re.search(r"(\d[\d\s\u00a0]*)", name)
         if match:
-            try:
-                return int(match.group(1).replace(" ", ""))
-            except ValueError:
-                pass
+            with contextlib.suppress(ValueError):
+                return int(match.group(1).replace(" ", "").replace("\u00a0", ""))
         return None
 
-    async def find_stars_package(self, stars: int) -> Optional[Dict[str, Any]]:
-        """
-        Ищет в каталоге пакет на `stars` звёзд.
-        Если точного совпадения нет — выбирает ближайший больший пакет,
-        чтобы покупатель получил не меньше оплаченного.
+    @staticmethod
+    def item_price_usdt(item: dict[str, Any]) -> float | None:
+        """Цена пакета в USDT (USD) из каталога."""
+        for key in ("price", "cost", "priceUsdt", "price_usdt"):
+            value = item.get(key)
+            if value is None:
+                continue
+            try:
+                price = float(str(value).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                return price
+        return None
+
+    async def find_stars_package(self, stars: int) -> dict[str, Any] | None:
+        """Пакет на `stars` звёзд; если точного нет — ближайший больший.
+
+        «Ближайший больший» принципиален: покупатель должен получить не меньше
+        оплаченного, иначе это спор на FunPay и потерянная репутация.
         """
         items = await self.get_catalog(item_type="telegramStars")
-        orderable_items = [i for i in items if i.get("orderable", True)]
+        orderable = [i for i in items if i.get("orderable", True)]
 
-        # 1. Точное совпадение
-        exact = [i for i in orderable_items if self.extract_item_stars(i) == stars]
+        exact = [i for i in orderable if self.extract_item_stars(i) == stars]
         if exact:
-            return min(exact, key=lambda x: float(x.get("price") or 10**9))
+            return min(exact, key=lambda x: self.item_price_usdt(x) or 10**9)
 
-        # 2. Ближайший больший пакет
-        greater = [
-            i for i in orderable_items
-            if (self.extract_item_stars(i) or 0) >= stars
-        ]
+        greater = [i for i in orderable if (self.extract_item_stars(i) or 0) >= stars]
         if greater:
-            greater.sort(key=lambda x: (self.extract_item_stars(x) or 0, float(x.get("price") or 10**9)))
+            greater.sort(key=lambda x: (self.extract_item_stars(x) or 0, self.item_price_usdt(x) or 10**9))
             chosen = greater[0]
             logger.info(
-                f"Точного пакета на {stars} звёзд нет в каталоге, выбран ближайший: "
-                f"{self.extract_item_stars(chosen)} звёзд за {chosen.get('price')} USD"
+                f"Точного пакета на {stars}⭐ нет, выбран ближайший: "
+                f"{self.extract_item_stars(chosen)}⭐ за {self.item_price_usdt(chosen)} USDT"
             )
             return chosen
-
         return None
 
+    async def price_for_stars(self, stars: int, fallback_usdt_per_1000: float = FALLBACK_USDT_PER_1000_STARS) -> float:
+        """Цена N звёзд в USDT: по каталогу, при недоступности — пропорционально эталону."""
+        package = await self.find_stars_package(stars)
+        if package is not None:
+            price = self.item_price_usdt(package)
+            if price:
+                package_stars = self.extract_item_stars(package) or stars
+                # пересчёт на фактическое количество звёзд, если пакет больше заказа
+                return round(price * (stars / package_stars) if package_stars else price, 4)
+        return round(stars / 1000.0 * fallback_usdt_per_1000, 4)
+
+    # ------------------------------------------------------------------ #
+    # заказы
+    # ------------------------------------------------------------------ #
     async def buy_telegram_stars(
         self,
         username: str,
@@ -159,139 +252,112 @@ class GameauClient:
         max_charge_usdt: float = 9.50,
         wait_completion: bool = False,
         hide_sender: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Отправляет запрос на покупку Stars с защитой по Idempotency Key и maxCharge.
-        Использует экспоненциальный backoff при временных ошибках 429/503.
-        """
-        idempotency_key = self._get_idempotency_key(order_id)
-        clean_username = username.replace("@", "").strip()
+    ) -> dict[str, Any]:
+        """Создаёт заказ telegramStars (идемпотентно по Idempotency-Key)."""
+        idempotency_key = self._idempotency_key(order_id)
+        clean_username = str(username).replace("@", "").strip()
+        if not clean_username:
+            return {"success": False, "error": "EMPTY_USERNAME"}
 
-        # Формируем тело запроса согласно документации Gameau REST API v1
         payload = {
             "telegram_username": clean_username,
             "username": clean_username,
             "quantity": int(quantity),
-            "maxCharge": float(max_charge_usdt),
+            "maxCharge": round(float(max_charge_usdt), 2),
         }
         if hide_sender:
             payload["hide_sender"] = 1
 
-        request_headers = {
-            **self.headers,
-            "Idempotency-Key": idempotency_key,
-        }
-
-        # Согласно документации Gameau v1, адрес: POST /api/v1/orders/telegramStars
-        # Также поддерживается /telegramStars для совместимости
-        order_urls = [
-            f"{self.base_url}/orders/telegramStars",
-            f"{self.base_url}/telegramStars",
-        ]
-        if "/v1" not in self.base_url:
-            order_urls.append(f"{self.base_url}/v1/orders/telegramStars")
+        request_headers = {**self.headers, "Idempotency-Key": idempotency_key}
+        urls = self._candidate_urls("orders/telegramStars") + self._candidate_urls("telegramStars")
+        urls = list(dict.fromkeys(urls))
 
         last_error = "NETWORK_TIMEOUT"
+        last_detail = ""
         client = await self._http()
 
         for attempt in range(self.max_retries):
-            for url in order_urls:
+            retry_wait: float | None = None
+            for url in urls:
                 try:
-                    response = await client.post(
-                        url,
-                        json=payload,
-                        headers=request_headers,
-                    )
-
-                    if response.status_code == 404:
-                        # Пробуем следующий альтернативный URL
-                        continue
-
-                    # Успешный ответ
-                    if response.status_code in (200, 201):
-                        data = response.json()
-                        order_obj = data.get("order") or data
-                        created_order_id = str(order_obj.get("id") or order_obj.get("orderId") or "")
-                        logger.info(
-                            f"[ORDER {order_id}] Успешно создан заказ в Gameau: {created_order_id} "
-                            f"({quantity} Stars для @{clean_username})"
-                        )
-
-                        if wait_completion and created_order_id:
-                            final_order = await self.wait_for_completion(created_order_id)
-                            return {
-                                "success": True,
-                                "data": final_order,
-                                "idempotency_key": idempotency_key,
-                            }
-
-                        return {
-                            "success": True,
-                            "data": order_obj,
-                            "idempotency_key": idempotency_key,
-                        }
-
-                    # Превышение maxCharge или смена цены
-                    elif response.status_code in (400, 409) and (
-                        "maxCharge" in response.text
-                        or "PRICE_CHANGED" in response.text
-                        or "price" in response.text.lower()
-                    ):
-                        logger.error(f"[ORDER {order_id}] Превышен лимит стоимости maxCharge!")
-                        return {"success": False, "error": "PRICE_EXCEEDED"}
-
-                    # Недостаточно средств
-                    elif response.status_code == 402 or (
-                        response.status_code == 400 and "INSUFFICIENT_BALANCE" in response.text
-                    ):
-                        logger.critical(f"[ORDER {order_id}] Недостаточно USDT на балансе Gameau!")
-                        return {"success": False, "error": "LOW_BALANCE"}
-
-                    # Временные ошибки (429 Too Many Requests, 502/503/504)
-                    elif response.status_code in (429, 502, 503, 504):
-                        logger.warning(
-                            f"[ORDER {order_id}] Временная ошибка Gameau ({response.status_code}). "
-                            f"Попытка {attempt + 1}/{self.max_retries}"
-                        )
-                        last_error = f"API_ERROR_{response.status_code}"
-                        break  # Переходим к следующему циклу retry с backoff
-
-                    else:
-                        logger.error(
-                            f"[ORDER {order_id}] Ошибка API Gameau: {response.status_code} - {response.text}"
-                        )
-                        return {
-                            "success": False,
-                            "error": f"API_ERROR_{response.status_code}",
-                        }
-
+                    response = await client.post(url, json=payload, headers=request_headers)
                 except httpx.RequestError as exc:
-                    logger.warning(
-                        f"[ORDER {order_id}] Сетевой сбой Gameau ({url}): {exc}"
-                    )
-                    last_error = "NETWORK_TIMEOUT"
+                    last_error, last_detail = "NETWORK_TIMEOUT", str(exc)
+                    retry_wait = 2**attempt + random.uniform(0, 0.5)
+                    logger.warning(f"[ORDER {order_id}] Сетевой сбой GAMEAU ({url}): {exc}")
                     break
 
-            if attempt < self.max_retries - 1:
-                await asyncio.sleep(2**attempt)
+                if response.status_code == 404:
+                    continue  # пробуем следующий вариант адреса
 
-        return {"success": False, "error": last_error}
+                if response.status_code in (200, 201):
+                    data = self._safe_json(response)
+                    order_obj = (data.get("order") if isinstance(data, dict) else None) or data or {}
+                    created_order_id = str(
+                        order_obj.get("id") or order_obj.get("orderId") or order_obj.get("order_id") or ""
+                    )
+                    logger.info(
+                        f"[ORDER {order_id}] Заказ создан в GAMEAU: {created_order_id or '?'} "
+                        f"({quantity}⭐ для @{clean_username}, maxCharge {payload['maxCharge']} USDT)"
+                    )
+                    if wait_completion and created_order_id:
+                        final_order = await self.wait_for_completion(created_order_id)
+                        return {"success": True, "data": final_order, "idempotency_key": idempotency_key}
+                    return {"success": True, "data": order_obj, "idempotency_key": idempotency_key}
 
-    async def get_order_status(self, order_id: str) -> Dict[str, Any]:
-        """Получает актуальный статус заказа (GET /orders/status/{order_id})."""
-        status_urls = [
-            f"{self.base_url}/orders/status/{order_id}",
-            f"{self.base_url}/status/{order_id}",
-        ]
+                body = redact(truncate(response.text, 300), self._secrets)
+
+                if response.status_code in (400, 409) and (
+                    "maxCharge" in body or "PRICE_CHANGED" in body or "price" in body.lower()
+                ):
+                    logger.error(f"[ORDER {order_id}] Цена выросла/превышен maxCharge: {body}")
+                    return {"success": False, "error": "PRICE_EXCEEDED", "detail": body}
+
+                if response.status_code == 402 or (response.status_code == 400 and "INSUFFICIENT_BALANCE" in body):
+                    logger.critical(f"[ORDER {order_id}] На балансе GAMEAU не хватает USDT!")
+                    return {"success": False, "error": "LOW_BALANCE", "detail": body}
+
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    last_error, last_detail = f"API_ERROR_{response.status_code}", body
+                    retry_wait = self._retry_after(response, 2**attempt + random.uniform(0, 0.5))
+                    logger.warning(
+                        f"[ORDER {order_id}] Временная ошибка GAMEAU {response.status_code} "
+                        f"(попытка {attempt + 1}/{self.max_retries})"
+                    )
+                    break  # идём на новый виток с backoff, а не долбим тот же URL
+
+                logger.error(f"[ORDER {order_id}] Ошибка GAMEAU API {response.status_code}: {body}")
+                return {"success": False, "error": f"API_ERROR_{response.status_code}", "detail": body}
+
+            if retry_wait is not None and attempt < self.max_retries - 1:
+                await asyncio.sleep(retry_wait)
+
+        return {"success": False, "error": last_error, "detail": last_detail}
+
+    @staticmethod
+    def _safe_json(response: httpx.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    async def get_order_status(self, order_id: str) -> dict[str, Any]:
+        """Текущий статус заказа GAMEAU (для reconciliation)."""
         client = await self._http()
-        for url in status_urls:
-            try:
-                response = await client.get(url, headers=self.headers)
+        for path in (f"orders/status/{order_id}", f"status/{order_id}", f"orders/{order_id}"):
+            for url in self._candidate_urls(path):
+                try:
+                    response = await client.get(url, headers=self.headers)
+                except httpx.RequestError as exc:
+                    logger.debug(f"Ошибка запроса статуса {url}: {exc}")
+                    continue
+                if response.status_code == 404:
+                    continue
                 if response.status_code == 200:
-                    data = response.json()
-                    return data.get("order") or data
-            except Exception as exc:
-                logger.debug(f"Ошибка запроса статуса по {url}: {exc}")
+                    data = self._safe_json(response)
+                    if isinstance(data, dict):
+                        return data.get("order") or data
+                logger.debug(f"GAMEAU статус #{order_id}: HTTP {response.status_code}")
         return {"status": "unknown"}
 
     async def wait_for_completion(
@@ -299,21 +365,17 @@ class GameauClient:
         order_id: str,
         poll_interval: float = 3.0,
         timeout: float = 120.0,
-    ) -> Dict[str, Any]:
-        """
-        Ожидает терминального статуса выполнения заказа (success / completed).
-        """
-        import time
-
-        deadline = time.time() + timeout
-        last_status = None
+    ) -> dict[str, Any]:
+        """Ждёт терминального статуса. При отказе GAMEAU бросает RuntimeError."""
+        deadline = time.time() + max(1.0, timeout)
+        last_status: str | None = None
 
         while time.time() < deadline:
             order_data = await self.get_order_status(order_id)
             status = str(order_data.get("status") or "").lower()
 
             if status != last_status:
-                logger.info(f"Заказ Gameau {order_id}: статус '{status}'")
+                logger.info(f"Заказ GAMEAU {order_id}: статус '{status or 'нет данных'}'")
                 last_status = status
 
             if status in SUCCESS_STATUSES:
@@ -323,20 +385,37 @@ class GameauClient:
 
             await asyncio.sleep(poll_interval)
 
-        logger.warning(f"Истёк тайм-аут ожидания заказа Gameau {order_id}")
+        logger.warning(f"Истёк тайм-аут ожидания заказа GAMEAU {order_id} ({timeout:.0f}s)")
         return {"id": order_id, "status": "timeout"}
 
-    async def get_account(self) -> Dict[str, Any]:
-        """Получает информацию об аккаунте Gameau (баланс USDT, статус)."""
+    async def get_account(self) -> dict[str, Any]:
+        """Аккаунт GAMEAU: баланс, статус (для --balance и алертов)."""
         client = await self._http()
-        try:
-            response = await client.get(
-                f"{self.base_url}/account",
-                headers=self.headers,
-            )
+        for url in self._candidate_urls("account"):
+            try:
+                response = await client.get(url, headers=self.headers)
+            except httpx.RequestError as exc:
+                return {"error": str(exc)}
             if response.status_code == 200:
-                data = response.json()
-                return data.get("account") or data
-            return {"error": f"HTTP_{response.status_code}", "status_code": response.status_code}
-        except Exception as exc:
-            return {"error": str(exc)}
+                data = self._safe_json(response)
+                if isinstance(data, dict):
+                    account = data.get("account") or data
+                    if isinstance(account, dict) and "balance" not in account:
+                        balance = parse_balance_usdt(account)
+                        if balance is not None:
+                            account = {**account, "balance": balance}
+                    return account if isinstance(account, dict) else {}
+            if response.status_code != 404:
+                return {
+                    "error": f"HTTP_{response.status_code}",
+                    "status_code": response.status_code,
+                    "detail": redact(truncate(response.text, 200), self._secrets),
+                }
+        return {"error": "NOT_FOUND", "status_code": 404}
+
+    async def ping(self) -> dict[str, Any]:
+        """Дешёвая проверка доступности API и ключа (для --check)."""
+        account = await self.get_account()
+        if "error" in account:
+            return {"ok": False, "error": account.get("error"), "detail": account.get("detail", "")}
+        return {"ok": True, "account": account, "balance": parse_balance_usdt(account)}

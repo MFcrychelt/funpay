@@ -75,6 +75,17 @@ CREATE_TASK_EVENTS_TS_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_task_events_ts ON task_events(ts_epoch);
 """
 
+# --- Флаги покупателей: чёрный список и ручные примечания (см. --blacklist) ---
+CREATE_BUYER_FLAGS_TABLE = """
+CREATE TABLE IF NOT EXISTS buyer_flags (
+    username TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'blacklist',
+    note TEXT,
+    created_ts INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 ALL_SCHEMAS = [
     CREATE_ORDERS_TABLE,
     CREATE_ORDERS_INDEX,
@@ -84,6 +95,7 @@ ALL_SCHEMAS = [
     CREATE_TASK_EVENTS_TABLE,
     CREATE_TASK_EVENTS_INDEX,
     CREATE_TASK_EVENTS_TS_INDEX,
+    CREATE_BUYER_FLAGS_TABLE,
 ]
 
 # Создаются ПОСЛЕ миграции legacy-баз (нужны колонки, которые миграция добавляет)

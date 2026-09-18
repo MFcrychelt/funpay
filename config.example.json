@@ -1,29 +1,53 @@
 {
-  "API": {
-    "url": "https://gameau.us/api/v1",
-    "token": "YOUR_GAMEAU_API_KEY",
-    "ping_url": "https://gameau.us/api/v1/ping",
-    "max_charge_usdt": 9.50,
-    "request_timeout": 30
-  },
-  "BOT": {
-    "enabled": 1,
-    "bot_token": "YOUR_BOT_TOKEN_HERE"
-  },
-  "FUNPAY": {
-    "golden_key": "YOUR_FUNPAY_GOLDEN_KEY"
-  },
-  "FINANCE": {
-    "cost_per_star_usd": 0.017,
-    "revenue_per_star_rub": 1.5,
-    "hide_sender": false
-  },
-  "SETTINGS": {
-    "db_path": "db.json",
-    "request_timeout": 10,
-    "order_check_interval": 10,
-    "admin_telegram_id": null
-  },
+  "_comment": "Необязательный файл: основные настройки лежат в .env (см. .env.example). config.json читается тем же Config-загрузчиком и удобен, когда переменные окружения неудобны. Ключи можно писать плоско (FUNPAY_GOLDEN_KEY) или секциями (API/FUNPAY/BOT/FINANCE/SETTINGS) — обе формы поддерживаются. Приоритет: переменные окружения > .env > config.json > значения по умолчанию. Сохраните как config.json рядом с exe/проектом.",
+
+  "funpay_golden_key": "PASTE_FUNPAY_GOLDEN_KEY",
+  "gameau_api_key": "PASTE_GAMEAU_API_KEY",
+  "gameau_base_url": "https://gameau.us/api/v1",
+  "default_max_charge_usdt": 9.5,
+  "max_charge_margin_pct": 5.0,
+  "default_stars_quantity": 1000,
+  "hide_sender": false,
+
+  "exchange_variant": 2,
   "rate_variant_1": 110.0,
-  "rate_variant_2": 87.63
+  "rate_variant_2": 87.63,
+  "usdt_per_1000_stars": 9.1,
+  "tron_energy_fee_rub": 0.0,
+
+  "seller_notify_token": "PASTE_TELEGRAM_BOT_TOKEN",
+  "seller_notify_chat_id": "PASTE_TELEGRAM_CHAT_ID",
+
+  "poll_interval": 5.0,
+  "stuck_task_minutes": 20,
+  "reconciliation_interval_sec": 60,
+  "max_order_retries": 2,
+  "wait_completion_timeout": 120,
+  "chat_monitor_interval_sec": 15,
+  "low_balance_threshold_usdt": 50.0,
+  "balance_check_interval_min": 10,
+  "stats_push_interval_min": 0,
+  "max_concurrent_orders": 4,
+  "shutdown_timeout": 30.0,
+
+  "max_order_revenue_rub": 0,
+  "min_margin_pct": 0,
+  "daily_spend_limit_usdt": 0,
+  "duplicate_window_min": 15,
+  "duplicate_action": "alert",
+  "blacklist_enabled": true,
+  "mute_hours": "",
+  "reply_need_username": "Здравствуйте! Не удалось автоматически распознать ваш Telegram @username. Пожалуйста, напишите его ответным сообщением в формате: @username",
+  "reply_delivered": "✅ Здравствуйте! {quantity_spaces} Telegram Stars успешно зачислены на аккаунт @{username}.\n\nПожалуйста, проверьте баланс в Telegram и подтвердите успешное выполнение заказа на FunPay! Спасибо за покупку!",
+  "reply_hold": "",
+  "reply_error": "",
+  "metrics_enabled": false,
+  "metrics_host": "127.0.0.1",
+  "metrics_port": 9155,
+  "metrics_token": "",
+
+  "db_path": "autostars.db",
+  "log_file": "autostars.log",
+  "log_max_bytes": 5000000,
+  "log_backup_count": 5
 }

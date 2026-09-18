@@ -1,15 +1,20 @@
 services:
-  funpay-stars:
+  autostars:
     build: .
-    container_name: funpay-stars-bot
+    image: autostars:local
+    container_name: autostars
     restart: unless-stopped
+    # PID 1 = python: SIGTERM от `docker stop` долетает до цикла,
+    # и он корректно дожидается текущих выдач (shutdown_timeout).
+    init: true
+    env_file:
+      - .env
     environment:
+      # база и логи — в каталоге, который переживает пересборку контейнера
+      AUTOSTARS_HOME: /app/data
       DB_PATH: /app/data/autostars.db
       LOG_FILE: /app/data/autostars.log
     volumes:
-      # Секреты и настройки хоста пробрасываем в контейнер.
-      - ./.env:/app/.env:ro
-      # База данных (заказы, статистика, трекер задач) и логи сохраняем
-      # в каталог ./data на хосте — переживают пересборку контейнера.
       - ./data:/app/data
-    command: ["python", "-m", "autostars.main"]
+    stop_grace_period: 60s
+    command: []

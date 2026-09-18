@@ -1,34 +1,58 @@
 # AutoStars — автовыдача Telegram Stars (FunPay → GAMEAU)
 #
 # Установка:
-#   1. Скопируйте проект в /opt/funpay
-#   2. python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-#   3. Заполните /opt/funpay/.env (см. .env.example)
-#   4. sudo cp deploy/autostars.service /etc/systemd/system/
-#   5. sudo systemctl daemon-reload && sudo systemctl enable --now autostars
+#   1. Положите проект в /opt/autostars (или /opt/funpay — тогда поправьте пути)
+#   2. python3 -m venv /opt/autostars/.venv
+#      /opt/autostars/.venv/bin/pip install -r /opt/autostars/requirements.txt
+#   3. mkdir -p /var/lib/autostars && chown autostars:autostars /var/lib/autostars
+#   4. создайте /etc/autostars.env с правами 600 (см. .env.example)
+#   5. sudo cp deploy/autostars.service /etc/systemd/system/
+#      sudo systemctl daemon-reload && sudo systemctl enable --now autostars
 #   6. journalctl -u autostars -f
 #
-# Управление (альтернатива — TG-команды /pause /resume):
-#   systemctl pause-autostars  →  python -m autostars.main --pause
-#   sudo systemctl restart autostars
+# Управление выдачей (можно и из Telegram: /pause /resume /stop):
+#   python -m autostars.main --pause      # не принимать новые заказы
+#   python -m autostars.main --resume     # возобновить
+#   systemctl restart autostars           # рестарт (graceful, до SHUTDOWN_TIMEOUT_SEC)
 
 [Unit]
-Description=AutoStars - FunPay Telegram Stars delivery via GAMEAU
+Description=AutoStars — автовыдача Telegram Stars на FunPay через GAMEAU
+Documentation=https://github.com/MFcrychelt/funpay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/funpay
-ExecStart=/opt/funpay/.venv/bin/python -m autostars.main
+User=autostars
+Group=autostars
+WorkingDirectory=/opt/autostars
+
+# конфигурация (ключи) и место, где лежат БД/лог
+EnvironmentFile=-/etc/autostars.env
+Environment=AUTOSTARS_HOME=/var/lib/autostars
+Environment=DB_PATH=/var/lib/autostars/autostars.db
+Environment=LOG_FILE=/var/lib/autostars/autostars.log
+
+ExecStart=/opt/autostars/.venv/bin/python -m autostars.main
+
+# корректная остановка: процесс сам ждёт текущие выдачи (SHUTDOWN_TIMEOUT_SEC),
+# systemd даёт запас и только потом добивает
+KillSignal=SIGTERM
+TimeoutStopSec=90
 Restart=always
 RestartSec=10
 
-# Лимиты для фоновой выдачи (не критичная нагрузка)
+# ограничения и безопасность: сервису не нужны права root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/autostars
+
+# нагрузка фоновая, критичной задержки нет
 Nice=5
 OOMScoreAdjust=500
 
-# Логи: journald + ротируемый файл autostars.log (см. .env: LOG_FILE)
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=autostars

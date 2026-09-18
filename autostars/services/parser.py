@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 # Комплексное регулярное выражение для извлечения Telegram Username
 TG_REGEX = re.compile(
@@ -45,7 +44,7 @@ RE_NUM_THEN_STAR = re.compile(r"(\d{1,9})\s*(?:⭐|✯)", re.IGNORECASE)
 RE_STAR_THEN_NUM = re.compile(r"(?:⭐|✯)\s*(\d{1,9})", re.IGNORECASE)
 
 
-def extract_telegram_username(text: Optional[str]) -> Optional[str]:
+def extract_telegram_username(text: str | None) -> str | None:
     """
     Извлекает чистый юзернейм из текста сообщения покупателя.
     Возвращает 'username' без символа '@' или None.
@@ -90,7 +89,7 @@ def extract_telegram_username(text: Optional[str]) -> Optional[str]:
     return None
 
 
-def extract_stars_quantity(text: Optional[str]) -> Optional[int]:
+def extract_stars_quantity(text: str | None) -> int | None:
     """
     Извлекает количество звёзд из описания лота или сообщения.
     Например: '1000 звёзд', '⭐ 500', '250 Stars'.

@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autostars"
+version = "2.4.0"
+description = "Автовыдача Telegram Stars на FunPay через GAMEAU B2B API: async-движок, SQLite-учёт, трекинг задач, статистика, Telegram-управление"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AutoStars contributors" }]
+keywords = [
+    "funpay",
+    "telegram-stars",
+    "gameau",
+    "automation",
+    "asyncio",
+    "sqlite",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+]
+
+# Ядро: только асинхронный движок autostars/. Legacy (legacy/main.py, legacy/bot/)
+# и GUI (flet) вынесены в extras/requirements-файлы — см. legacy/requirements.txt.
+dependencies = [
+    "httpx>=0.27,<1",
+    "aiosqlite>=0.20,<1",
+    "beautifulsoup4>=4.12,<5",
+]
+
+[project.optional-dependencies]
+# Desktop-интерфейс: pip install "autostars[gui]"
+gui = ["flet>=0.86.1,<1"]
+# Тесты и линтеры: pip install -e ".[dev]"  (flet не нужен для тестов ядра)
+dev = [
+    "pytest>=8.0",
+    "anyio>=4.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+]
+build = ["pyinstaller>=6.6"]
+
+[project.scripts]
+autostars = "autostars.main:main"
+
+# Windows: запуск без консоли (flet-приложение)
+[project.gui-scripts]
+autostars-gui = "autostars.gui.app:main"
+
+[project.urls]
+Homepage = "https://github.com/MFcrychelt/funpay"
+Repository = "https://github.com/MFcrychelt/funpay"
+Issues = "https://github.com/MFcrychelt/funpay/issues"
+
+[tool.setuptools.packages.find]
+include = ["autostars*"]
+
+[tool.setuptools.package-data]
+autostars = ["py.typed", "*.json"]
+
+# ----------------------------------------------------------------------------- #
+# Инструменты
+# ----------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = ["legacy", "build", "dist", ".venv", "venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",     # длина строки — тексты отчётов иHelp-строки намеренно длинные
+    "SIM105",   # contextlib.suppress читается хуже, чем try/except/pass
+    "RUF001",   # "безопасные" unicode-символы: в проекте русский текст и ⭐ в строках
+    "RUF002",
+    "RUF003",
+    "B905",     # zip(strict=...) требует py310+, оставляем совместимость
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "SIM117"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
