@@ -56,6 +56,8 @@ class AutoStarsGUI:
         self.status_text: Optional[ft.Text] = None
         self.log_list: Optional[ft.ListView] = None
         self.stats_text: Optional[ft.Text] = None
+        self.page: Optional[ft.Page] = None
+        self.check_status = ft.Text("", size=13, color=ft.Colors.WHITE)
 
         # Themed colors
         self.theme = {
@@ -69,7 +71,7 @@ class AutoStarsGUI:
         }
 
     def _add_log(self, msg: str, level: str = "info"):
-        """Добавить строку в лог-виджет (потокобезопасно)."""
+        """Добавить строку в лог-виджет и обновить UI."""
         if not self.log_list:
             return
         colors = {
@@ -84,6 +86,12 @@ class AutoStarsGUI:
         )
         if len(self.log_list.controls) > 200:
             self.log_list.controls = self.log_list.controls[-200:]
+        # Обновляем UI чтобы сообщение отобразилось
+        if self.page:
+            try:
+                self.page.update()
+            except Exception:
+                pass
 
     def _start_bot(self, e):
         """Запуск бота в отдельном потоке."""
@@ -158,12 +166,25 @@ class AutoStarsGUI:
         cfg = read_config()
         api_key = cfg.get("API", {}).get("token", "")
         base_url = cfg.get("API", {}).get("url", "https://gameau.us/api/v1")
+
         if not api_key:
-            self._add_log("❌ API токен не задан", "error")
+            msg = "❌ API токен не задан — заполните в настройках"
+            self._add_log(msg, "error")
+            if self.check_status:
+                self.check_status.value = msg
+                self.check_status.color = ft.Colors.RED_400
+            if self.page:
+                try: self.page.update()
+                except: pass
             return
 
+        if self.check_status:
+            self.check_status.value = "⏳ Проверяю..."
+            self.check_status.color = ft.Colors.AMBER_400
+            try: self.page.update()
+            except: pass
+
         import urllib.request
-        import json as _json
         try:
             req = urllib.request.Request(
                 f"{base_url}/ping",
@@ -171,11 +192,24 @@ class AutoStarsGUI:
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 200:
-                    self._add_log("✅ GAMEAU API доступен", "success")
+                    msg = "✅ GAMEAU API доступен"
+                    self._add_log(msg, "success")
+                    color = ft.Colors.GREEN_400
                 else:
-                    self._add_log(f"❌ GAMEAU ответил: {resp.status}", "error")
+                    msg = f"❌ GAMEAU ответил: {resp.status}"
+                    self._add_log(msg, "error")
+                    color = ft.Colors.RED_400
         except Exception as ex:
-            self._add_log(f"❌ GAMEAU недоступен: {ex}", "error")
+            msg = f"❌ GAMEAU недоступен: {ex}"
+            self._add_log(msg, "error")
+            color = ft.Colors.RED_400
+
+        if self.check_status:
+            self.check_status.value = msg
+            self.check_status.color = color
+        if self.page:
+            try: self.page.update()
+            except: pass
 
     def _save_settings(self, e, fields: dict):
         """Сохранение настроек из полей ввода."""
@@ -293,6 +327,7 @@ class AutoStarsGUI:
 
     def build(self, page: ft.Page):
         """Построение основного интерфейса."""
+        self.page = page
         page.title = "⭐ AutoStars — Управление ботом"
         page.bgcolor = ft.Colors.BLACK
         page.window.width = 800
@@ -378,6 +413,7 @@ class AutoStarsGUI:
                                     icon=ft.Icons.CALCULATE,
                                 ),
                             ]),
+                            self.check_status,
                         ]),
                         bgcolor=ft.Colors.GREY_900,
                         border_radius=8,
