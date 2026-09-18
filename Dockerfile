@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
-COPY bot ./bot
+# Основной движок автовыдачи (async)
+COPY autostars ./autostars
 
 # Конфигурация монтируется/копируется отдельно (секреты не в образе):
-#   config.json — настройки, .env — ключи.
-CMD ["python", "main.py"]
+#   .env — ключи и параметры (см. .env.example)
+CMD ["python", "-m", "autostars.main"]

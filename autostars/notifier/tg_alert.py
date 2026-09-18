@@ -106,6 +106,31 @@ class TelegramNotifier:
             logger.error(f"Не удалось отправить уведомление в Telegram: {exc}")
             return False
 
+    async def send_stats_report(self, text: str, parse_mode: str = "HTML") -> bool:
+        """
+        Отправляет развёрнутый статистический отчёт (1ч/2ч/3ч/4ч/6ч/день).
+        Делит длинный текст на части (лимит Telegram — 4096 символов).
+        """
+        if not text.strip():
+            return True
+        chunks: list[str] = []
+        current = ""
+        for line in text.splitlines():
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > 4000 and current:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+
+        ok = True
+        for i, chunk in enumerate(chunks, 1):
+            suffix = f"\n\n— часть {i}/{len(chunks)}" if len(chunks) > 1 else ""
+            ok = await self.send_alert(chunk + suffix, parse_mode=parse_mode) and ok
+        return ok
+
     async def alert_order_completed(
         self,
         order_id: str,
