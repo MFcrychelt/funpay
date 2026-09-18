@@ -218,7 +218,7 @@ async def test_telegram_alert_sending():
     async with httpx.AsyncClient(transport=httpx.MockTransport(mock_transport)) as client:
         # Патчим метод send_alert для перехвата запросов
 
-        async def mocked_send(text, parse_mode="HTML"):
+        async def mocked_send(text, parse_mode="HTML", *, critical=True):
             payload = {"chat_id": notifier.chat_id, "text": text, "parse_mode": parse_mode}
             resp = await client.post("https://api.telegram.org/botTEST_BOT_TOKEN/sendMessage", json=payload)
             return resp.status_code == 200
@@ -417,7 +417,7 @@ class MockNotifier:
         r = rate or self.whitebird_rate
         return round(order_price_rub - (usdt_cost * r), 2)
 
-    async def send_alert(self, text, parse_mode="HTML"):
+    async def send_alert(self, text, parse_mode="HTML", *, critical=True):
         self.alerts.append(text)
         return True
 

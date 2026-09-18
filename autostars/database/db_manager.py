@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ PRAGMAS = (
     "PRAGMA foreign_keys=ON",
 )
 
-# Выraжение времени заказа: unix-эпоха (универсальная, не зависит от часового пояса)
+# Выражение времени заказа: unix-эпоха (универсальная, не зависит от часового пояса)
 TS_EXPR = "COALESCE(created_ts, CAST(strftime('%s', created_at) AS INTEGER))"
 UPDATED_TS_EXPR = "COALESCE(updated_ts, CAST(strftime('%s', updated_at) AS INTEGER))"
 
@@ -42,8 +43,12 @@ TERMINAL_FAIL_STATUSES = (
     "FAILED_DELIVERY",
     "CANCELLED",
 )
-# Статусы, при которых допустим ручной ретрай заказа
-RETRYABLE_STATUSES = TERMINAL_FAIL_STATUSES
+# Задержанные политикой выдачи: это не провал и не «в работе» — заказ ждёт решения
+# человека (`--release`/`/release`). В IN_PROGRESS_STATUSES его брать нельзя:
+# иначе reconciliation каждые 20 минут будут кричать «задача зависла».
+HOLD_STATUSES = ("HOLD_MANUAL",)
+# Статусы, при которых допустима ручная выдача/ретрай: провалы + задержанные
+RETRYABLE_STATUSES = HOLD_STATUSES + TERMINAL_FAIL_STATUSES
 
 
 class DBManager:
@@ -342,6 +347,7 @@ class DBManager:
                               THEN 1 ELSE 0 END), 0) AS failed,
             COALESCE(SUM(CASE WHEN status IN ('PROCESSING','WAITING_USERNAME') THEN 1 ELSE 0 END), 0) AS in_progress,
             COALESCE(SUM(CASE WHEN status = 'WAITING_USERNAME' THEN 1 ELSE 0 END), 0) AS waiting_username,
+            COALESCE(SUM(CASE WHEN status = 'HOLD_MANUAL' THEN 1 ELSE 0 END), 0) AS held,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN quantity ELSE 0 END), 0) AS stars,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN price_rub ELSE 0 END), 0.0) AS revenue_rub,
             COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN cost_usdt ELSE 0 END), 0.0) AS cost_usdt,
@@ -472,6 +478,153 @@ class DBManager:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    # ------------------------------------------------------------------ #
+    # Риск-менеджмент: лимиты, дубликаты, флаги покупателей
+    # ------------------------------------------------------------------ #
+    async def sum_cost_usdt_since(self, since_ts: int) -> float:
+        """Сумма списаний (USDT) по заказам с `since_ts` — для суточного лимита.
+
+        Учитываются все статусы, кроме отменённых: деньги уже ушли, и «вернуть»
+        их статистика не может.
+        """
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT COALESCE(SUM(cost_usdt), 0) FROM orders "
+            "WHERE status <> 'CANCELLED' AND COALESCE(updated_ts, created_ts, 0) >= ?",
+            (int(since_ts),),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    async def find_recent_order_by_username(
+        self, username: str, quantity: int | None = None, *, since_ts: int, exclude_order_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Последний заказ того же покупателя (окно `since_ts`) — признак дубля."""
+        conn = await self.get_connection()
+        # в orders.username движок хранит ник без '@', но пользователи (и старые
+        # версии БД) пишут его по-разному → сравниваем нормализованное значение
+        query = (
+            "SELECT order_id, status, quantity, price_rub, created_ts FROM orders "
+            "WHERE REPLACE(LOWER(COALESCE(username, '')), '@', '') = ?"
+            " AND COALESCE(created_ts, 0) >= ?"
+        )
+        params: list[Any] = [str(username).lstrip("@").lower(), int(since_ts)]
+        if quantity is not None:
+            query += " AND quantity = ?"
+            params.append(int(quantity))
+        if exclude_order_id:
+            query += " AND order_id <> ?"
+            params.append(str(exclude_order_id))
+        query += " ORDER BY created_ts DESC LIMIT 1"
+        async with conn.execute(query, tuple(params)) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def add_buyer_flag(self, username: str, kind: str = "blacklist", note: str | None = None) -> None:
+        """Ставит флаг покупателю (по умолчанию — в чёрный список)."""
+        conn = await self.get_connection()
+        await conn.execute(
+            "INSERT INTO buyer_flags (username, kind, note, created_ts) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(username) DO UPDATE SET kind = excluded.kind, note = excluded.note, "
+            "created_ts = excluded.created_ts",
+            (f"@{username.lstrip('@')}", kind, note, int(time.time())),
+        )
+        await conn.commit()
+
+    async def remove_buyer_flag(self, username: str, kind: str | None = None) -> int:
+        conn = await self.get_connection()
+        target = f"@{username.lstrip('@')}"
+        if kind:
+            cursor = await conn.execute("DELETE FROM buyer_flags WHERE username = ? AND kind = ?", (target, kind))
+        else:
+            cursor = await conn.execute("DELETE FROM buyer_flags WHERE username = ?", (target,))
+        await conn.commit()
+        return cursor.rowcount or 0
+
+    async def list_buyer_flags(self, kind: str | None = None) -> list[dict[str, Any]]:
+        conn = await self.get_connection()
+        if kind:
+            cursor = await conn.execute(
+                "SELECT username, kind, note, created_ts FROM buyer_flags WHERE kind = ? ORDER BY created_ts DESC",
+                (kind,),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT username, kind, note, created_ts FROM buyer_flags ORDER BY created_ts DESC"
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def is_buyer_flagged(self, username: str, kind: str = "blacklist") -> bool:
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT 1 FROM buyer_flags WHERE username = ? AND kind = ? LIMIT 1",
+            (f"@{username.lstrip('@')}", kind),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def buyer_stats(self, since_ts: int, limit: int = 20) -> list[dict[str, Any]]:
+        """Сводка по покупателям за период: оборот, средняя маржа, провалы."""
+        conn = await self.get_connection()
+        async with conn.execute(
+            "SELECT username,"
+            " COUNT(*) AS orders,"
+            " SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed,"
+            " SUM(CASE WHEN status LIKE 'FAILED%' THEN 1 ELSE 0 END) AS failed,"
+            " COALESCE(SUM(quantity), 0) AS stars,"
+            " COALESCE(SUM(price_rub), 0.0) AS revenue_rub,"
+            " COALESCE(SUM(cost_rub), 0.0) AS cost_rub,"
+            " COALESCE(SUM(profit_rub), 0.0) AS profit_rub,"
+            " MAX(COALESCE(updated_ts, created_ts, 0)) AS last_ts"
+            " FROM orders WHERE username IS NOT NULL AND COALESCE(created_ts, 0) >= ?"
+            " GROUP BY username ORDER BY revenue_rub DESC LIMIT ?",
+            (int(since_ts), int(limit)),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def select_orders(
+        self,
+        *,
+        since: str | None = None,
+        until: str | None = None,
+        statuses: Sequence[str] | None = None,
+        username: str | None = None,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Произвольная выборка заказов для выгрузки/отчётов (без бизнес-правил).
+
+        `since`/`until` — строки `YYYY-MM-DD HH:MM:SS` (UTC), сравниваются с
+        `created_at`. Возвращает dict'ы в порядке убывания даты создания.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if since:
+            where.append("COALESCE(created_at, '') >= ?")
+            params.append(since)
+        if until:
+            where.append("COALESCE(created_at, '') <= ?")
+            params.append(until)
+        if statuses:
+            wanted = [str(s) for s in statuses if str(s).strip()]
+            if wanted:
+                where.append(f"status IN ({','.join('?' * len(wanted))})")
+                params.extend(wanted)
+        if username:
+            where.append("REPLACE(LOWER(COALESCE(username, '')), '@', '') = ?")
+            params.append(str(username).lstrip("@").lower())
+        sql = "SELECT * FROM orders"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {TS_EXPR} DESC"
+        if limit and limit > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        conn = await self.get_connection()
+        async with conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
 
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         """Получает значение настройки."""

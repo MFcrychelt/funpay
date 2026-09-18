@@ -5,13 +5,20 @@ Long-polling getUpdates (вебхук-сервер не нужен). Коман�
 
 Команды:
   /help, /status, /stats, /report, /tasks, /balance,
-  /pause, /resume, /retry <order_id>, /calc <цена ₽> [звёзды]
+  /pause, /resume, /retry <order_id>, /calc <цена ₽> [звёзды],
+  /limits, /held, /release <order_id>, /blacklist [add|remove @nick], /customers [дней]
+
+Права: команды принимает только владелец чата из TELEGRAM_CHAT_ID (`_authorized`).
+`/release` — единственная команда, которая тратит деньги «в обход» политики выдачи:
+она осознанно ручная и работает только для статуса HOLD_MANUAL.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -35,6 +42,11 @@ HELP_TEXT = (
     "/resume — возобновить выдачу\n"
     "/retry &lt;id заказа&gt; — повторить проваленный заказ\n"
     "/calc &lt;цена ₽&gt; [звёзды] — калькулятор прибыли\n"
+    "/limits — лимиты выдачи и сколько потрачено сегодня\n"
+    "/held — заказы, задержанные политикой (ждут решения)\n"
+    "/release &lt;id&gt; — отпустить задержанный заказ (покупает звёзды!)\n"
+    "/blacklist — стоп-лист; /blacklist add @nick [NOTE] | remove @nick\n"
+    "/customers [дней] — топ покупателей за период\n"
     "/stop — корректно остановить цикл (текущие выдачи дождёмся)\n\n"
     "Пример: /retry 1234567890"
 )
@@ -162,6 +174,7 @@ def build_default_handlers(
     в живом цикле.
     """
     from ..services import bot_control
+    from ..services.policy import format_username
 
     async def h_status(_args: str) -> str | None:
         paused = await bot_control.is_bot_paused(db)
@@ -283,6 +296,122 @@ def build_default_handlers(
             return f"⏳ Заказ #{order_id}: покупателю отправлен запрос @username."
         return f"Результат: {res}"
 
+
+    async def h_limits(_args: str) -> str | None:
+        pol = cfg.order_policy()
+        spent = 0.0
+        with contextlib.suppress(Exception):
+            spent = await db.sum_cost_usdt_since(pol.day_start_ts())
+        counts = await tracker.summary()
+        held = int(counts.get("HOLD_MANUAL", 0))
+        lines = [
+            "🛡 <b>Политика выдачи</b>",
+            f"Лимит сделки: {pol.max_order_revenue_rub:.0f} ₽" if pol.max_order_revenue_rub else "Лимит сделки: выключен",
+            f"Мин. маржа: {pol.min_margin_pct:.1f}%" if pol.min_margin_pct else "Мин. маржа: выключена",
+            f"Суточный бюджет: {pol.daily_spend_limit_usdt:.2f} USDT" if pol.daily_spend_limit_usdt
+            else "Суточный бюджет: выключен",
+            f"Дубли: окно {pol.duplicate_window_min} мин → {pol.duplicate_action}" if pol.duplicate_window_min
+            else "Дубли: не проверяются",
+            f"Стоп-лист: {'вкл' if pol.blacklist_enabled else 'выкл'} "
+            f"({len(await _flag_list(db))} ник.)",
+            f"Потрачено с полуночи: {spent:.2f} USDT",
+            f"Задержано заказов: {held}" + (" — /held" if held else ""),
+        ]
+        return "\n".join(lines)
+
+    async def h_held(_args: str) -> str | None:
+        rows = await db.get_orders_by_status(("HOLD_MANUAL",), limit=10)
+        if not rows:
+            return "✅ Задержанных заказов нет."
+        lines = ["⛔ <b>Ждут решения:</b>"]
+        for row in rows:
+            oid = row.get("order_id")
+            lines.append(
+                f"#{oid} {format_username(row.get('username'))} • {row.get('quantity')}⭐ • {row.get('price_rub')} ₽\n"
+                f"   {str(row.get('error') or '').strip() or 'без причины'}\n"
+                f"   /release {oid}  •  отказать: `--cancel {oid} -y` в консоли"
+            )
+        return "\n".join(lines)
+
+    async def h_release(args: str) -> str | None:
+        order_id = args.strip()
+        if not order_id:
+            return "Использование: /release <id заказа>\nСписок задержанных: /held"
+        row = await db.get_order(order_id)
+        if row is None:
+            return f"❓ Заказ #{order_id} не найден."
+        if row.get("status") != "HOLD_MANUAL":
+            return f"⛔ #{order_id} не задержан (статус {row.get('status')}). Для провалов — /retry {order_id}"
+        if not row.get("username"):
+            return f"⏳ #{order_id}: нет @username — выдача невозможна, ждём ответа покупателя."
+        lc = loop_controls or {}
+        funpay = lc.get("funpay")
+        if funpay is None:
+            return "⚠️ Отпустить заказ можно только при работающем цикле (/release в CLI: `--release`)."
+        res = await bot_control.retry_failed_order(
+            order_id=order_id,
+            db=db,
+            funpay_client=funpay,
+            gameau_client=gameau_client,
+            tg_notifier=notifier,
+            tracker=tracker,
+            policy=cfg.order_policy(),
+            ignore_policy=True,
+            default_quantity=cfg.default_stars_quantity,
+            max_charge_usdt=cfg.default_max_charge_usdt,
+            whitebird_rate=cfg.active_usdt_rate,
+            hide_sender=cfg.hide_sender,
+            max_order_retries=cfg.max_order_retries,
+            wait_completion_timeout=cfg.wait_completion_timeout,
+            usdt_per_1000_stars=cfg.usdt_per_1000_stars,
+            max_charge_margin_pct=cfg.max_charge_margin_pct,
+        )
+        updated = await db.get_order(order_id)
+        state = (updated or {}).get("status")
+        if state == "COMPLETED":
+            return (f"✅ #{order_id} выдан: @{str(row.get('username')).lstrip('@')} × {row.get('quantity')}⭐, "
+                    f"прибыль {(updated or {}).get('profit_rub')} ₽")
+        return (f"⚠️ #{order_id}: результат {res.get('status')}, статус {state}. "
+                f"{str((updated or {}).get('error') or '')[:200]}")
+
+    async def h_blacklist(args: str) -> str | None:
+        parts = args.split(maxsplit=2)
+        action = parts[0].lower() if parts else "list"
+        nick = parts[1].lstrip("@") if len(parts) > 1 else ""
+        note = parts[2] if len(parts) > 2 else ""
+        if action == "add" and nick:
+            await db.add_buyer_flag(nick, note=note or None)
+            return f"✅ @{nick} в стоп-листе" + (f" ({note})" if note else "") + ". Его заказы будут задерживаться."
+        if action in ("remove", "rm") and nick:
+            removed = await db.remove_buyer_flag(nick)
+            return f"✅ @{nick} убран из стоп-листа" if removed else f"@{nick} в стоп-листе не значится."
+        rows = await _flag_list(db)
+        if not rows:
+            return "Стоп-лист пуст. /blacklist add @nick причина"
+        return "🚫 <b>Стоп-лист:</b>\n" + "\n".join(
+            f"• {format_username(r.get('username'))}"
+            + (f" — {r.get('note')}" if r.get("note") else "")
+            for r in rows
+        )
+
+    async def h_customers(args: str) -> str | None:
+        try:
+            days = float(args) if args.strip() else 7.0
+        except ValueError:
+            return "Использование: /customers [дней]\nНапример: /customers 30"
+        since = int(time.time() - max(days, 1 / 24) * 86400)
+        rows = await db.buyer_stats(since, limit=8)
+        if not rows:
+            return f"За {days:g} суток заказов не было."
+        lines = [f"👥 <b>Покупатели за {days:g} сут. (топ-8 по обороту):</b>"]
+        for row in rows:
+            lines.append(
+                f"{format_username(row.get('username'))}: {row['orders']} зак. / {row['completed']} готово"
+                f"{' / ' + str(row['failed']) + ' провал.' if row.get('failed') else ''}"
+                f" • {float(row['revenue_rub']):.0f} ₽ → +{float(row['profit_rub']):.0f} ₽"
+            )
+        return "\n".join(lines)
+
     async def h_stop(_args: str) -> str | None:
         """Корректная остановка цикла прямо из Telegram (graceful shutdown)."""
         if not loop_controls or "stop" not in loop_controls:
@@ -321,9 +450,22 @@ def build_default_handlers(
         "resume": h_resume,
         "retry": h_retry,
         "calc": h_calc,
+        "limits": h_limits,
+        "held": h_held,
+        "release": h_release,
+        "blacklist": h_blacklist,
+        "customers": h_customers,
         "stop": h_stop,
     }
 
 
 async def _help() -> str:
     return HELP_TEXT
+
+
+async def _flag_list(db: Any) -> list[dict[str, Any]]:
+    """Стоп-лист: тестовые заглушки db могут не иметь этого метода."""
+    try:
+        return list(await db.list_buyer_flags("blacklist"))
+    except Exception:
+        return []

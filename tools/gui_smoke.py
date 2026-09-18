@@ -36,6 +36,7 @@ def main() -> int:
         "build_dashboard",
         "build_stats",
         "build_orders",
+        "build_delivery",
         "build_settings",
         "build_logs",
         "build_diag",
@@ -66,6 +67,24 @@ def main() -> int:
             ]
         )
         app._render_stats({"windows": [{"label": "Всего", "orders_total": 2, "stars": 1000}], "active_rate": 87.63})
+        app._render_delivery(
+            {
+                "held": [{"order_id": "7", "username": "@dave", "quantity": 10000, "price_rub": 13704.0,
+                          "error": "LARGE_ORDER: выручка больше лимита"}],
+                "spent": 163.8,
+                "limit": 100.0,
+                "flags": [{"username": "@mallory", "note": "кидалово", "created_at": "2026-09-18 12:00:00"}],
+                "max_order": 5000.0,
+                "min_margin": 12.0,
+                "duplicates": 15,
+                "duplicate_action": "alert",
+                "blacklist": True,
+                "mute": "23-07",
+            }
+        )
+        app._render_delivery({"held": [], "spent": None, "limit": 0.0, "flags": [], "max_order": 0.0,
+                              "min_margin": 0.0, "duplicates": 0, "duplicate_action": "alert",
+                              "blacklist": False, "mute": ""})
         app.refresh_status()
         print("  ok  рендер таблиц и статуса")
     except Exception as exc:

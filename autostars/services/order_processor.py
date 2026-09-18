@@ -17,6 +17,7 @@ import logging
 from typing import Any
 
 from .parser import extract_stars_quantity, extract_telegram_username
+from .policy import ReplyTemplates, alert_text, evaluate_order_risk, summarize
 from .task_tracker import (
     EV_COMPLETED,
     EV_FAILED,
@@ -29,6 +30,8 @@ from .task_tracker import (
     EV_PARSED_OK,
     EV_RECEIVED,
     EV_RETRY,
+    EV_RISK_ALERT,
+    EV_RISK_HOLD,
     EV_TG_ALERT,
     EV_WAITING_USERNAME,
     TaskTracker,
@@ -143,6 +146,8 @@ async def process_paid_order(
     bypass_processed_check: bool = False,
     usdt_per_1000_stars: float = 9.10,
     max_charge_margin_pct: float = 5.0,
+    policy: Any | None = None,
+    ignore_policy: bool = False,
 ) -> dict[str, Any]:
     """
     Обрабатывает оплаченный заказ с FunPay.
@@ -189,11 +194,12 @@ async def process_paid_order(
         # Отправляем авто-ответ с просьбой уточнить никнейм
         logger.info(f"[ORDER {order_id}] Юзернейм не найден. Отправка запроса покупателю.")
         await tracker.log(order_id, EV_PARSED_FAIL, "username не распознан")
-        reply_clarify = (
-            "Здравствуйте! Не удалось автоматически распознать ваш Telegram @username. "
-            "Пожалуйста, напишите его ответным сообщением в формате: @username"
-        )
-        await funpay_client.send_message(node=chat_node, text=reply_clarify)
+        templates = policy.templates if policy is not None else ReplyTemplates()
+        reply_clarify = templates.render("need_username", order_id=order_id)
+        if reply_clarify:
+            await funpay_client.send_message(node=chat_node, text=reply_clarify)
+        else:
+            logger.info(f"[ORDER {order_id}] Шаблон need_username пуст — сообщение не отправлено")
         await db.save_order_status(
             order_id=order_id,
             username=None,
@@ -229,6 +235,65 @@ async def process_paid_order(
     if package_name:
         await tracker.log(order_id, EV_PACKAGE_SELECTED, f"{package_name} = {fallback_price} USDT")
 
+    # 2.5. Политика выдачи: лимиты, дубликаты, стоп-лист. Проверки ДО запроса в
+    # GAMEAU — списанные USDT обратно не вернуть, поэтому здесь решается,
+    # стоит ли вообще нажимать «купить».
+    price_rub = float(order_data.get("price") or 0.0)
+    if policy is not None and policy.any_check_on and not ignore_policy:
+        est_cost_rub = round(float(fallback_price) * float(policy.rate_rub_per_usdt), 2)
+        try:
+            checks = await evaluate_order_risk(
+                policy,
+                db,
+                order_id=order_id,
+                username=username,
+                quantity=int(quantity),
+                price_rub=price_rub,
+                cost_rub=est_cost_rub,
+                order_cost_usdt=float(fallback_price),
+            )
+        except Exception as exc:  # политика не должна ронять выдачу
+            logger.warning(f"[ORDER {order_id}] Проверки политики пропущены: {exc}")
+            checks = []
+        hold_check, alerts = summarize(checks)
+
+        if alerts and tg_notifier is not None:
+            message = alert_text(
+                order_id, username, int(quantity), price_rub, alerts, held=hold_check is not None
+            )
+            with contextlib.suppress(Exception):
+                await tg_notifier.send_alert(message, critical=hold_check is not None)
+
+        if hold_check is not None:
+            await db.save_order_status(
+                order_id=order_id,
+                username=username,
+                status="HOLD_MANUAL",
+                chat_node=str(chat_node),
+                quantity=int(quantity),
+                price_rub=price_rub,
+                error=f"{hold_check.code}: {hold_check.reason}"[:500],
+            )
+            await tracker.log(order_id, EV_RISK_HOLD, f"{hold_check.code}: {hold_check.reason}")
+            hold_reply = (policy.templates if policy else ReplyTemplates()).render(
+                "hold", order_id=order_id, username=username, quantity=int(quantity),
+                reason=hold_check.reason,
+            )
+            if hold_reply:
+                with contextlib.suppress(Exception):
+                    await funpay_client.send_message(node=chat_node, text=hold_reply)
+            logger.warning(f"[ORDER {order_id}] Заказ задержан политикой: {hold_check.reason}")
+            return {
+                "status": "held",
+                "order_id": order_id,
+                "code": hold_check.code,
+                "reason": hold_check.reason,
+            }
+        if alerts:
+            await tracker.log(
+                order_id, EV_RISK_ALERT, "; ".join(f"{c.code}({c.action})" for c in alerts)
+            )
+
     # 3. Фиксируем статус 'PROCESSING' в БД
     await db.save_order_status(
         order_id=order_id,
@@ -236,7 +301,7 @@ async def process_paid_order(
         status="PROCESSING",
         chat_node=str(chat_node),
         quantity=quantity,
-        price_rub=float(order_data.get("price") or 0.0),
+        price_rub=price_rub,
     )
 
     # 4. Вызываем API Gameau с повторными попытками при сетевых сбоях
@@ -311,6 +376,16 @@ async def process_paid_order(
                 await tracker.log(order_id, EV_FAILED, "GAMEAU delivery failed")
                 await _alert_delivery_failed(order_id, username, quantity, err_status,
                                              usdt_cost, order_data.get("price"), tg_notifier, tracker)
+                await _reply_buyer(
+                    funpay_client,
+                    chat_node,
+                    policy.templates if policy is not None else ReplyTemplates(),
+                    "error",
+                    order_id=order_id,
+                    username=username,
+                    quantity=int(quantity),
+                    reason=err_status,
+                )
                 return {"status": "failed", "error": "GAMEAU_DELIVERY_FAILED", "order_id": order_id}
             except Exception as exc:
                 logger.warning(f"[ORDER {order_id}] wait_for_completion завершился с ошибкой: {exc}")
@@ -333,6 +408,16 @@ async def process_paid_order(
             await tracker.log(order_id, EV_FAILED, err_status)
             await _alert_delivery_failed(order_id, username, quantity, err_status,
                                          usdt_cost, order_data.get("price"), tg_notifier, tracker)
+            await _reply_buyer(
+                funpay_client,
+                chat_node,
+                policy.templates if policy is not None else ReplyTemplates(),
+                "error",
+                order_id=order_id,
+                username=username,
+                quantity=int(quantity),
+                reason=err_status,
+            )
             return {"status": "failed", "error": "GAMEAU_DELIVERY_FAILED", "order_id": order_id}
 
         if waited and final_status not in (
@@ -400,14 +485,23 @@ async def process_paid_order(
         )
         await tracker.log(order_id, EV_COMPLETED, f"profit={profit_rub}₽")
 
-        formatted_quantity = f"{quantity:,}".replace(",", " ")
-        reply_text = (
-            f"✅ Здравствуйте! {formatted_quantity} Telegram Stars успешно зачислены на аккаунт @{username}.\n\n"
-            f"Пожалуйста, проверьте баланс в Telegram и подтвердите успешное выполнение заказа на FunPay! Спасибо за покупку!"
+        # Ответ покупателю — из шаблона (REPLY_DELIVERED). Значение по умолчанию
+        # совпадает с текстом, который движок писал раньше, поэтому «включил
+        # шаблоны — переписка не поменялась». Пустой шаблон = не отправляем.
+        templates = policy.templates if policy is not None else ReplyTemplates()
+        replied = await _reply_buyer(
+            funpay_client,
+            chat_node,
+            templates,
+            "delivered",
+            order_id=order_id,
+            username=username,
+            quantity=int(quantity),
+            price_rub=float(order_data.get("price") or 0.0),
         )
-        if await funpay_client.send_message(node=chat_node, text=reply_text):
+        if replied:
             await tracker.log(order_id, EV_FUNPAY_REPLY, "покупателю отправлено подтверждение")
-        else:
+        elif templates.delivered:
             logger.warning(f"[ORDER {order_id}] Не удалось отправить сообщение покупателю")
 
         # Уведомляем владельца в TG-бота с анализом прибыльности обоих вариантов
@@ -451,6 +545,16 @@ async def process_paid_order(
                 f"🚨 <b>ОШИБКА: НИЗКИЙ БАЛАНС GAMEAU!</b> Заказ #{order_id} остановлен. Срочно пополните USDT через Whitebird!"
             )
         await tracker.log(order_id, EV_TG_ALERT, "критический алерт LOW_BALANCE")
+        await _reply_buyer(
+            funpay_client,
+            chat_node,
+            policy.templates if policy is not None else ReplyTemplates(),
+            "error",
+            order_id=order_id,
+            username=username,
+            quantity=int(quantity),
+            reason="баланс продавца не позволяет выдать звёзды сейчас",
+        )
         return {"status": "failed", "error": "LOW_BALANCE", "order_id": order_id}
 
     elif result["error"] in ("PRICE_EXCEEDED",):
@@ -471,6 +575,16 @@ async def process_paid_order(
                 f"⚠️ <b>ВНИМАНИЕ:</b> Превышен лимит стоимости maxCharge ({charge_limit} USDT) для заказа #{order_id}!"
             )
         await tracker.log(order_id, EV_TG_ALERT, "алерт PRICE_EXCEEDED")
+        await _reply_buyer(
+            funpay_client,
+            chat_node,
+            policy.templates if policy is not None else ReplyTemplates(),
+            "error",
+            order_id=order_id,
+            username=username,
+            quantity=int(quantity),
+            reason="стоимость закупки превысила лимит продавца",
+        )
         return {"status": "failed", "error": "PRICE_EXCEEDED", "order_id": order_id}
 
     else:
@@ -488,7 +602,31 @@ async def process_paid_order(
         # Оценка убытка: потерянная потенциальная выручка заказа
         await _alert_delivery_failed(order_id, username, quantity, str(err),
                                      0.0, order_data.get("price"), tg_notifier, tracker)
+        await _reply_buyer(
+            funpay_client,
+            chat_node,
+            policy.templates if policy is not None else ReplyTemplates(),
+            "error",
+            order_id=order_id,
+            username=username,
+            quantity=int(quantity),
+            reason=str(err),
+        )
         return {"status": "failed", "error": err, "order_id": order_id}
+
+
+async def _reply_buyer(
+    funpay_client: Any, chat_node: Any, templates: ReplyTemplates, kind: str, **context: Any
+) -> bool:
+    """Отправляет шаблон покупателю; пустой шаблон или нет клиента — тихо False."""
+    text = templates.render(kind, **context)
+    if not text or funpay_client is None:
+        return False
+    try:
+        return bool(await funpay_client.send_message(node=chat_node, text=text))
+    except Exception as exc:
+        logger.warning(f"Не удалось отправить покупателю шаблон '{kind}': {exc}")
+        return False
 
 
 async def _alert_delivery_failed(

@@ -25,11 +25,26 @@
 - 📊 **Статистика и P&L** — окна 1/2/3/4/6/24 ч, календарный день и «всего»: заказы,
   звёзды, выручка ₽, затраты USDT/₽, прибыль, маржа, убыточные сделки, провалы
 - 📱 **Telegram** — алерт по каждой сделке (прибыль по обоим курсам), критические
-  события, авто-отправка статистики и **управление с телефона**: `/status /stats
-  /report /tasks /balance /pause /resume /retry <id> /calc /stop`
+  события, авто-отправка статистики (в «тихие часы» — только критичное) и
+  **управление с телефона**: `/status /stats /report /tasks /balance /pause /resume
+  /retry <id> /calc /limits /held /release <id> /blacklist /customers /stop`
 - 💬 **Чат-мониторинг** — если покупатель написал `@username` в чат FunPay, выдача
   стартует сама, без повторного запроса
-- 🖥 **GUI (flet)** — запуск/остановка цикла, статус, статистика, заказы, хвост логов,
+- 🚦 **Политика выдачи (защита от «купил и потерял»)** — лимит сделки в ₽, минимальная
+  маржа, суточный бюджет USDT, поиск дублей, чёрный список покупателей. Сработало —
+  заказ **не покупается**, а уходит в `HOLD_MANUAL` и ждёт решения: `--held`,
+  `--release <id>` / `--cancel <id>`, в Telegram `/held` и `/release <id>`
+- ✍️ **Шаблоны ответов покупателю** — `REPLY_NEED_USERNAME / REPLY_DELIVERED /
+  REPLY_HOLD / REPLY_ERROR` с подстановками `{username} {quantity} {quantity_spaces}
+  {order_id} {price_rub} {reason}`; пусто = не отправляем (по умолчанию тексты те же,
+  что были в коде)
+- 📤 **Ручная выдача и выгрузка** — `--order @nick 1000` (выдать вне сделки на FunPay),
+  `--export orders.csv --since 7d` (Excel/BA), `--customers` (оборот и провалы по
+  покупателям), `--blacklist add @nick причина`
+- 📈 **Метрики** — `GET /metrics` (Prometheus) + `/healthz` + `/status` (JSON) на
+  `127.0.0.1`, по умолчанию выключено (`METRICS_ENABLED=false`)
+- 🖥 **GUI (flet)** — 7 вкладок: запуск/остановка цикла, статус, статистика, заказы,
+  «Выдача» (задержанные заказы, стоп-лист, выгрузка CSV, расход за сутки), хвост логов,
   редактор настроек с проверкой значений; секреты в форме не показываются
 - 📦 **Установка в один клик** — `install.bat` (Windows) / `pip install -e .`, сборка
   `.exe` через `build.bat`, самодиагностика `check_env.py`
@@ -49,14 +64,17 @@ autostars/                    # поддерживаемый движок (async
 │   ├── funpay.py             # FunPay: csrf, long polling runner/, чаты, ответы
 │   └── gameau.py             # GAMEAU API v1: каталог, telegramStars, статусы, баланс
 ├── database/
-│   ├── models.py             # схема SQLite (orders, task_events, idempotency, settings)
+│   ├── models.py             # схема SQLite (orders, task_events, idempotency, settings, buyer_flags)
 │   └── db_manager.py         # CRUD, WAL/busy_timeout, миграции, агрегаты статистики
 ├── services/
 │   ├── parser.py             # @username / t.me/... / количество звёзд из текста
 │   ├── order_processor.py    # пайплайн: парсинг → GAMEAU → ответ → алерт (ретраи, семафор)
 │   ├── statistics.py         # окна статистики, убытки, отчёты, JSON
 │   ├── task_tracker.py       # события задач, «зависшие», reconciliation
+│   ├── policy.py             # политика выдачи: лимиты, дубли, стоп-лист, шаблоны
+│   ├── export.py             # выгрузка истории в CSV/JSON (периоды, фильтры)
 │   └── bot_control.py        # пауза/резюм, флаг в БД, состояние цикла
+├── metrics.py                # /metrics (Prometheus), /healthz, /status — по желанию
 ├── notifier/
 │   ├── tg_alert.py           # Telegram-алерты + калькуляция прибыли
 │   └── tg_commands.py        # интерактивный бот владельца (long polling)
@@ -128,7 +146,8 @@ docker compose up -d --build && docker compose logs -f
 ## 📊 Команды CLI
 
 Все команды работают и в исходниках, и в exe (`AutoStarsBot.exe --check`).
-Машинный вывод — флагом `--json` (для `--stats`, `--report`, `--tasks`, `--balance`).
+Машинный вывод — флагом `--json` (для `--stats`, `--report`, `--tasks`, `--balance`,
+`--limits`, `--held`, `--customers`, `--blacklist list`, `--export`).
 
 | Команда | Назначение |
 |---|---|
@@ -146,6 +165,16 @@ docker compose up -d --build && docker compose logs -f
 | `--balance` | баланс GAMEAU + «на сколько заказов 1000⭐ хватит» |
 | `--pause` / `--resume` | пауза приёма новых заказов (флаг в БД, переживает рестарт) |
 | `--retry-order <ID>` | повторить проваленный заказ (идемпотентно, без двойной покупки) |
+| `--limits` | политика выдачи: лимиты, суточный бюджет, что задержано |
+| `--held` | заказы в `HOLD_MANUAL` (ждут решения) — кто, сколько и почему |
+| `--release <ID>` `-y` | отпустить задержанный заказ: выдать, ignoring политику |
+| `--cancel <ID>` `-y` `--note "…"` | отклонить задержанный заказ (деньги не списывались) |
+| `--order @nick [звёзды]` `--dry-run` `-y` | ручная выдача вне сделки FunPay |
+| `--blacklist list\|add @nick [причина]\|remove @nick` | стоп-лист покупателей |
+| `--customers [--days 7]` | покупатели за период: оборот, готово, провалы |
+| `--templates` | текущие шаблоны ответов покупателю и плейсхолдеры |
+| `--export файл.csv\|json` `--since 7d` `--failed` `--buyer @nick` `--with-events` | выгрузка истории |
+| `--metrics` | снимок метрик в формате Prometheus (то, что отдаёт `/metrics`) |
 | `--test-order <username>` `--test-qty 50` `--dry-run` `-y` | проверка выдачи на своём аккаунте |
 | `--config PATH` | явный `config.json` вместо `.env` |
 | `-v` / `--version` | отладочный уровень / версия |
@@ -157,7 +186,11 @@ docker compose up -d --build && docker compose logs -f
 
 Живой цикл слушает команды **только владельца** (`TELEGRAM_CHAT_ID`), long polling —
 вебхук и открытые порты не нужны: `/help` `/status` `/stop` `/pause` `/resume`
-`/stats` `/report` `/tasks` `/balance` `/retry 123456` `/calc 1370.4 1000`.
+`/stats` `/report` `/tasks` `/balance` `/retry 123456` `/calc 1370.4 1000`
+`/limits` `/held` `/release 123456` `/blacklist add @nick причина` `/customers 30`.
+
+`/release` — единственная команда, которая тратит деньги «вопреки» политике выдачи:
+она работает только для статуса `HOLD_MANUAL` и только при живом цикле.
 
 ## 💰 Финансовая модель (USDT TRC-20 → gameau.us)
 
@@ -209,6 +242,14 @@ autostars --calc 1370.4 1000
 | `STARTUP_RETRY_DELAY` / `STARTUP_MAX_RETRIES` | `15` / `0` | повторы логина при старте (`0` = вечно) |
 | `LOW_BALANCE_THRESHOLD_USDT` / `BALANCE_CHECK_INTERVAL_MIN` | `50.0` / `10` | контроль баланса GAMEAU и алерт |
 | `STATS_PUSH_INTERVAL_MIN` | `0` | авто-статистика в Telegram (`0` — выкл) |
+| `MAX_ORDER_REVENUE_RUB` | `0` | выручка больше → заказ задерживается (`0` — выкл) |
+| `MIN_MARGIN_PCT` | `0` | маржа ниже → держим (по курсу активного варианта) |
+| `DAILY_SPEND_LIMIT_USDT` | `0` | суточный бюджет закупки: превысил — держим |
+| `DUPLICATE_WINDOW_MIN` / `DUPLICATE_ACTION` | `15` / `alert` | окно поиска дублей и реакция (`alert\|hold\|ignore`) |
+| `BLACKLIST_ENABLED` | `true` | задерживать заказы ником из стоп-листа |
+| `REPLY_NEED_USERNAME` / `REPLY_DELIVERED` / `REPLY_HOLD` / `REPLY_ERROR` | см. `.env.example` | шаблоны ответов покупателю; пусто = не отправляем |
+| `MUTE_HOURS` | — | «тихие часы» для некритичных алертов, напр. `23-07` |
+| `METRICS_ENABLED` / `METRICS_HOST` / `METRICS_PORT` / `METRICS_TOKEN` | `false` / `127.0.0.1` / `9155` / — | Prometheus-метрики и `/healthz` |
 | `DB_PATH` / `LOG_FILE` | `autostars.db` / `autostars.log` | где лежать базе и логу |
 | `LOG_MAX_BYTES` × `LOG_BACKUP_COUNT` | `5000000` × `5` | ротация лога |
 | `GAMEAU_BASE_URL` / `GAMEAU_TIMEOUT` / `GAMEAU_MAX_RETRIES` | `https://gameau.us/api/v1` / `20` / `3` | сеть до GAMEAU |
@@ -226,7 +267,7 @@ autostars --calc 1370.4 1000
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q                      # 154 теста: движок, CLI, GUI-мост, настройки
+python -m pytest -q                      # 247 тестов: движок, CLI, GUI-мост, настройки
 python -m pytest legacy/tests -q          # 45 тестов legacy-реализации
 python tools/gui_smoke.py                 # собирается ли интерфейс (без запуска окна)
 python -m ruff check autostars tests      # линтер (конфиг в pyproject.toml)
@@ -243,7 +284,11 @@ CI ([ci/github-ci.yml](ci/github-ci.yml)) прогоняет это на Python 
 (`abcd…********…wxyz`, `redact()` чистит строки от `golden_key`/`api_key`/токенов
 Telegram), в `--config-show` выводятся только замаскированные значения.
 `maxCharge` не даёт списать больше согласованного, а `Idempotency-Key` — купить
-звёзды дважды при ретрае. Ключ GAMEAU уходит только на `gameau.us`, входящих портов у системы нет.
+звёзды дважды при ретрае. Ключ GAMEAU уходит только на `gameau.us`, входящих портов у
+системы нет — кроме метрик: `METRICS_ENABLED=true` поднимает HTTP на `127.0.0.1:9155`
+(наружу не торчит; наружу — только через reverse-proxy и с `METRICS_TOKEN`).
+Политика выдачи при этом работает как «предохранитель»: суточный бюджет USDT и лимит
+сделки не дадут списать кошелёк целиком, если доступ к боту или к FunPay перехвачен.
 
 Автоматизация FunPay — зона риска самого продавца (правила площадки), покупка
 звёзд — реальные деньги: начните с `--test-order --dry-run`, затем 20–50⭐ на

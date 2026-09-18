@@ -34,9 +34,12 @@ if str(ROOT) not in sys.path:  # запуск из исходников без �
 from autostars.config import Config  # noqa: E402
 from autostars.paths import app_dir  # noqa: E402
 
+#: Белый список флагов, которые GUI разрешает подмешивать к запуску цикла
+#: (лишний флаг из формы — не аргумент; опасные --release/--cancel идут через run_cli).
 CLI_FLAGS = ("--once", "--check", "--catalog", "--deposit-info", "--stats", "--report",
              "--tasks", "--stats-push", "--balance", "--pause", "--resume",
-             "--config-show", "--json", "-v", "--verbose")
+             "--config-show", "--json", "-v", "--verbose",
+             "--limits", "--held", "--customers", "--templates", "--metrics")
 
 
 @dataclasses.dataclass
@@ -339,6 +342,95 @@ def is_paused(db_path: str | Path) -> bool:
         return bool(row) and str(row[0]) == "1"
     except sqlite3.Error:
         return False
+
+
+
+def read_held_orders(db_path: str | Path, limit: int = 20) -> list[dict[str, Any]]:
+    """Заказы, задержанные политикой выдачи (HOLD_MANUAL) — только чтение."""
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(path), timeout=3.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=3000")
+            rows = conn.execute(
+                "SELECT order_id, username, quantity, price_rub, cost_usdt, error, created_ts"
+                " FROM orders WHERE status = 'HOLD_MANUAL'"
+                " ORDER BY COALESCE(updated_ts, created_ts, 0) DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        wanted = ("order_id", "username", "quantity", "price_rub", "cost_usdt", "error", "created_ts")
+        return [dict(zip(wanted, row)) for row in rows]
+    except sqlite3.Error:
+        return []
+
+
+def read_spend_today_usdt(db_path: str | Path) -> float | None:
+    """Сколько USDT списано с полуночи (тот же запрос, что у суточного лимита)."""
+    import time
+
+    path = Path(db_path)
+    if not path.exists():
+        return None
+    now = time.localtime()
+    midnight = int(time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1)))
+    try:
+        conn = sqlite3.connect(str(path), timeout=3.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=3000")
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usdt), 0) FROM orders "
+                "WHERE status <> 'CANCELLED' AND COALESCE(updated_ts, created_ts, 0) >= ?",
+                (midnight,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+        return float(row[0] or 0.0) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def read_buyer_flags(db_path: str | Path, kind: str = "blacklist") -> list[dict[str, Any]]:
+    """Стоп-лист покупателей (пусто, если таблицы ещё нет — она создаётся с v2.4)."""
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(path), timeout=3.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=3000")
+            rows = conn.execute(
+                "SELECT username, note, created_at FROM buyer_flags WHERE kind = ?"
+                " ORDER BY created_ts DESC LIMIT 50",
+                (kind,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        return [{"username": r[0], "note": r[1], "created_at": r[2]} for r in rows]
+    except sqlite3.Error:
+        return []
+
+
+def export_orders(out_path: str | Path, *, period: str = "", failed: bool = False,
+                  with_events: bool = False, timeout: float = 120.0) -> CommandResult:
+    """Выгрузка истории (тот же `--export`, что и в консоли)."""
+    args = ["--export", str(out_path)]
+    if period:
+        args += ["--since", period]
+    if failed:
+        args.append("--failed")
+    if with_events:
+        args.append("--with-events")
+    return run_cli(*args, timeout=timeout)
 
 
 def read_log_tail(log_path: str | Path, lines: int = 200) -> list[str]:

@@ -15,9 +15,28 @@
     python -m autostars.main --balance            # баланс GAMEAU и «на сколько заказов хватит»
     python -m autostars.main --pause / --resume   # пауза/возобновление приёма заказов
     python -m autostars.main --retry-order 123    # повтор проваленного заказа (идемпотентно)
+    python -m autostars.main --limits             # политика выдачи и расход с полуночи
+    python -m autostars.main --held               # задержанные заказы (ждут решения)
+    python -m autostars.main --release 123 -y      # отпустить задержанный заказ
+    python -m autostars.main --cancel 123 -y       # отклонить задержанный заказ
+    python -m autostars.main --order @nick 1000     # ручная выдача вне сделки FunPay
+    python -m autostars.main --blacklist add @nick причина   # стоп-лист покупателей
+    python -m autostars.main --customers --days 30 # покупатели за период
+    python -m autostars.main --templates            # шаблоны ответов покупателю
+    python -m autostars.main --export out.csv --since 7d     # выгрузка истории
+    python -m autostars.main --metrics              # снимок в формате Prometheus
 
 В живом цикле доступны TG-команды владельца: /help /status /stats /report /tasks
-/balance /pause /resume /retry <id> /calc <цена> [звёзды].
+/balance /pause /resume /retry <id> /calc <цена> [звёзды] /limits /held
+/release <id> /blacklist /customers.
+
+Что добавлено в v2.4 (кроме hygiene-ревизии 2.3):
+  • политика выдачи — лимит сделки, минимальная маржа, суточный бюджет USDT, поиск
+    дублей и стоп-лист: всё считается ДО покупки, спорный заказ уходит в `HOLD_MANUAL`
+    (не в `FAILED`: оплата уже есть) и ждёт `--held` + `--release`/`--cancel`;
+  • шаблоны ответов покупателю в конфиге (REPLY_*), «тихие часы» для алертов;
+  • ручная выдача (--order), выгрузка истории (--export csv/json), --customers;
+  • /metrics + /healthz + /status (по умолчанию выключено, слушает localhost).
 
 Что исправлено в v2.3:
   • остановка по SIGTERM/SIGINT корректно дожидается задач в работе (graceful
@@ -59,6 +78,7 @@ from .notifier.tg_commands import TelegramCommandServer, build_default_handlers
 from .security import mask_secret
 from .services import bot_control
 from .services.order_processor import process_paid_order
+from .services.policy import evaluate_order_risk, format_username
 from .services.statistics import StatisticsService
 from .services.task_tracker import TaskTracker, reconcile_inflight_orders
 
@@ -126,6 +146,7 @@ def build_notifier(cfg: Config) -> TelegramNotifier:
         rate_variant_2=cfg.rate_variant_2,
         active_variant=cfg.exchange_variant,
         tron_energy_fee_rub=cfg.tron_energy_fee_rub,
+        mute_window=cfg.mute_window(),
     )
 
 
@@ -166,6 +187,7 @@ def _order_kwargs(cfg: Config) -> dict[str, Any]:
         "wait_completion_timeout": cfg.wait_completion_timeout,
         "usdt_per_1000_stars": cfg.usdt_per_1000_stars,
         "max_charge_margin_pct": cfg.max_charge_margin_pct,
+        "policy": cfg.order_policy(),
     }
 
 
@@ -371,6 +393,421 @@ async def cmd_retry(cfg: Config, order_id: str) -> int:
             await funpay.close()
             await gameau.close()
             await notifier.close()
+
+
+# ============================================================================ #
+# Ручная выдача, лимиты, стоп-лист, выгрузка
+# ============================================================================ #
+
+def _confirm_or_exit(assume_yes: bool, question: str, code: int = 2) -> bool:
+    """Подтверждение «рука оператора»: без `-y` в неинтерактивном режиме — отказ."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"\n❌ {question} Подтвердите действие флагом -y.")
+        return False
+    answer = input(f"\n{question} [y/N] ").strip().lower()
+    return answer in ("y", "yes", "да")
+
+
+async def cmd_held(cfg: Config, as_json: bool = False, limit: int = 20) -> int:
+    """Список заказов, задержанных политикой выдачи (ждут решения человека)."""
+    async with open_db(cfg) as db:
+        rows = await TaskTracker(db).held_orders(limit=limit)
+        if as_json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if not rows:
+            print("✅ Задержанных заказов нет — политика выдачи чиста.")
+            return 0
+        print(f"⛔ Задержано политикой выдачи: {len(rows)} (ждут решения)\n")
+        for row in rows:
+            reason = str(row.get("error") or row.get("error_message") or "").strip() or "без причины"
+            print(
+                f"  • #{row.get('order_id')} {format_username(row.get('username'))} "
+                f"{row.get('quantity')}⭐ за {row.get('price_rub')} ₽ — {reason}\n"
+                f"    отпустить: autostars --release {row.get('order_id')} -y"
+            )
+        return 0
+
+
+async def cmd_release(cfg: Config, order_id: str, assume_yes: bool = False, as_json: bool = False) -> int:
+    """Отпускает задержанный заказ: выдаёт его в обход политики (решение человека)."""
+    cfg.validate()
+    async with open_db(cfg) as db:
+        row = await db.get_order(order_id)
+        if row is None:
+            print(f"[ERR] Заказ #{order_id} не найден в базе.")
+            return 1
+        status = row.get("status")
+        if status != "HOLD_MANUAL":
+            print(f"❌ #{order_id} сейчас в статусе {status} — освобождать нечего. "
+                  "Для проваленных заказов есть --retry-order.")
+            return 1
+        if not row.get("username"):
+            print("❌ У заказа нет @username — выдача невозможна: дождитесь ответа покупателя "
+                  "(чат-мониторинг продолжит сам).")
+            return 1
+        question = (
+            f"Отпустить #{order_id}: {format_username(row.get('username'))} × {row.get('quantity')}⭐ "
+            f"(выручка {row.get('price_rub')} ₽)? Будет куплено ~"
+            f"{(row.get('quantity') or 0) / 1000 * cfg.usdt_per_1000_stars:.2f} USDT."
+        )
+        if not _confirm_or_exit(assume_yes, question):
+            return 2
+        funpay, gameau, notifier = build_funpay(cfg), build_gameau(cfg), build_notifier(cfg)
+        try:
+            result = await bot_control.retry_failed_order(
+                order_id=order_id,
+                db=db,
+                funpay_client=funpay,
+                gameau_client=gameau,
+                tg_notifier=notifier,
+                tracker=TaskTracker(db),
+                ignore_policy=True,
+                **_order_kwargs(cfg),
+            )
+        finally:
+            await funpay.close()
+            await gameau.close()
+            await notifier.close()
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, default=str))
+        updated = await db.get_order(order_id)
+        state = (updated or {}).get("status")
+        ok = state == "COMPLETED"
+        detail = (updated or {})
+        if ok:
+            print(f"✅ Заказ #{order_id} выдан: {state}, затраты {detail.get('cost_usdt')} USDT, "
+                  f"прибыль {detail.get('profit_rub')} ₽")
+        else:
+            print(f"❌ Заказ #{order_id}: результат {result.get('status')}, статус {state} "
+                  f"({detail.get('error') or result.get('error') or 'см. --timeline ' + order_id})")
+        return 0 if ok else 1
+
+
+async def cmd_cancel_held(cfg: Config, order_id: str, note: str = "", assume_yes: bool = False) -> int:
+    """Отклоняет задержанный заказ (деньги не списывались — просто закрываем сделку)."""
+    async with open_db(cfg) as db:
+        row = await db.get_order(order_id)
+        if row is None:
+            print(f"[ERR] Заказ #{order_id} не найден в базе.")
+            return 1
+        if not _confirm_or_exit(assume_yes, f"Отклонить #{order_id} (статус {row.get('status')}) и вернуть "
+                                            f"{row.get('price_rub')} ₽ покупателю на FunPay?"):
+            return 2
+        tracker = TaskTracker(db)
+        await db.save_order_status(
+            order_id,
+            row.get("username"),
+            "CANCELLED",
+            error=note or "отклонено вручную (политика выдачи)",
+        )
+        await tracker.log(order_id, "MANUAL_CANCEL", note or "отклонено оператором")
+        print(f"✔ Заказ #{order_id} помечен CANCELLED. Не забудьте отменить сделку на стороне FunPay — "
+              "бот её не закрывает и деньги не возвращает.")
+        return 0
+
+
+async def cmd_limits(cfg: Config, as_json: bool = False) -> int:
+    """Что политика выдачи считает сегодня и сколько уже потрачено."""
+    pol = cfg.order_policy()
+    async with open_db(cfg) as db:
+        spent = 0.0
+        held: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            spent = await db.sum_cost_usdt_since(pol.day_start_ts())
+        with contextlib.suppress(Exception):
+            held = await TaskTracker(db).held_orders(limit=100)
+    payload = {
+        "limits": {
+            "max_order_revenue_rub": pol.max_order_revenue_rub,
+            "min_margin_pct": pol.min_margin_pct,
+            "daily_spend_limit_usdt": pol.daily_spend_limit_usdt,
+            "duplicate_window_min": pol.duplicate_window_min,
+            "duplicate_action": pol.duplicate_action,
+            "blacklist_enabled": pol.blacklist_enabled,
+        },
+        "spent_today_usdt": round(spent, 4),
+        "remaining_today_usdt": round(max(0.0, pol.daily_spend_limit_usdt - spent), 4)
+        if pol.daily_spend_limit_usdt > 0
+        else None,
+        "held": len(held),
+        "rate_rub_per_usdt": pol.rate_rub_per_usdt,
+        "mute_window": cfg.mute_window(),
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print("Политика выдачи (защита от убытка):\n")
+    lim = payload["limits"]
+    rows = [
+        ("MAX_ORDER_REVENUE_RUB", f"{lim['max_order_revenue_rub']:.0f} ₽", "держит крупные сделки"),
+        ("MIN_MARGIN_PCT", f"{lim['min_margin_pct']:.1f} %", "держит сделки ниже маржи"),
+        ("DAILY_SPEND_LIMIT_USDT", f"{lim['daily_spend_limit_usdt']:.2f} USDT", "суточный бюджет на закупку"),
+        ("DUPLICATE_WINDOW_MIN", f"{lim['duplicate_window_min']} мин ({lim['duplicate_action']})", "повтор того же ника и количества"),
+        ("BLACKLIST_ENABLED", "вкл" if lim["blacklist_enabled"] else "выкл", "стоп-лист покупателей"),
+        ("MUTE_HOURS", f"{payload['mute_window'] or '—'}", "тихие часы для некритичных алертов"),
+    ]
+    off = ("0", "0.0", "0.00 USDT", "выкл", "0 мин (alert)", "0 мин (ignore)", "—")
+    for name, value, hint in rows:
+        print(f"  {'•' if value not in off else '·'} {name:<24} {value:<22} {hint}")
+    if all(v in off for _, v, _ in rows):
+        print("\n  Все проверки выключены: бот покупает любой оплаченный заказ. "
+              "Начните с MAX_ORDER_REVENUE_RUB и DAILY_SPEND_LIMIT_USDT.")
+    print(f"\n  Потрачено с полуночи: {spent:.2f} USDT", end="")
+    if pol.daily_spend_limit_usdt > 0:
+        print(f" из {pol.daily_spend_limit_usdt:.2f} "
+              f"(осталось {payload['remaining_today_usdt']:.2f})")
+    else:
+        print(" (лимит выключен)")
+    print(f"  Задержано заказов: {len(held)}   "
+          f"{'— autostars --held' if held else ''}")
+    print("\n  Ключи — в .env (или вкладка «Политика» в GUI): 0/пусто = проверка выключена.")
+    return 0
+
+
+async def cmd_blacklist(cfg: Config, action: str, username: str | None = None,
+                        note: str = "", as_json: bool = False) -> int:
+    """Стоп-лист покупателей: list | add @nick | remove @nick."""
+    async with open_db(cfg) as db:
+        if action == "add":
+            if not username:
+                print("[ERR] --blacklist add требует @username.")
+                return 1
+            await db.add_buyer_flag(username, note=note or None)
+            print(f"✅ @{username.lstrip('@')} добавлен(а) в стоп-лист — "
+                  "заказы этому покупателю будут задерживаться.")
+            return 0
+        if action == "remove":
+            if not username:
+                print("[ERR] --blacklist remove требует @username.")
+                return 1
+            removed = await db.remove_buyer_flag(username)
+            print(f"✅ Убрано записей: {removed}" if removed else f"@{username.lstrip('@')} в стоп-листе не значится.")
+            return 0 if removed else 1
+        rows = await db.list_buyer_flags("blacklist")
+        if as_json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if not rows:
+            print("Стоп-лист пуст. Добавить: autostars --blacklist add @username \"причина\"")
+            return 0
+        print(f"Стоп-лист покупателей ({len(rows)}):")
+        for row in rows:
+            print(f"  • @{str(row.get('username')).lstrip('@')}"
+                  + (f" — {row.get('note')}" if row.get("note") else ""))
+        return 0
+
+
+async def cmd_customers(cfg: Config, days: float = 7.0, limit: int = 20, as_json: bool = False) -> int:
+    """Покупатели за период: оборот, прибыль, провалы — «кого держать на прицеле»."""
+    since = int(time.time() - max(days, 1 / 24) * 86400)
+    async with open_db(cfg) as db:
+        rows = await db.buyer_stats(since, limit=limit)
+        if as_json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if not rows:
+            print(f"За {days:g} суток заказов не было.")
+            return 0
+        print(f"Покупатели за {days:g} суток (топ-{len(rows)} по обороту):\n")
+        print(f"  {'ник':<20} {'заказов':>8} {'готово':>7} {'провалов':>9} "
+              f"{'звёзд':>8} {'оборот ₽':>11} {'прибыль ₽':>10}")
+        for row in rows:
+            nick = str(row.get("username") or "?")[:19]
+            print(f"  {nick:<20} {row['orders']:>8} {row['completed']:>7} {row['failed']:>9} "
+                  f"{row['stars']:>8} {row['revenue_rub']:>11.2f} {row['profit_rub']:>10.2f}")
+        return 0
+
+
+async def cmd_export(cfg: Config, out: str, *, fmt: str = "csv", period: str | None = None,
+                     status: str | None = None, failed: bool = False, buyer: str | None = None,
+                     events: bool = False, limit: int = 0, as_json: bool = False) -> int:
+    """Выгружает историю заказов в файл (CSV для Excel / JSON для импорта)."""
+    from .services.export import export_csv, export_json, parse_period
+
+    window = parse_period(period)
+    since, until = window if window else (None, None)
+    async with open_db(cfg) as db:
+        writer = export_json if fmt == "json" else export_csv
+        try:
+            summary = await writer(
+                db, out,
+                with_events=events,
+                since=since,
+                until=until,
+                status=status,
+                only_failed=failed,
+                buyer=buyer,
+                limit=limit,
+            )
+        except ValueError as exc:
+            print(f"[ERR] {exc}")
+            return 1
+    summary["period"] = period or "all"
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    print(f"✅ Выгружено {summary['orders']} заказов → {summary['path']}")
+    if summary.get("events_path"):
+        print(f"   хронология событий ({summary['events']}) → {summary['events_path']}")
+    print(f"   выручка {summary['revenue_rub']} ₽, затраты {summary['cost_usdt']} USDT, "
+          f"прибыль {summary['profit_rub']} ₽")
+    return 0
+
+
+async def cmd_manual_order(cfg: Config, username: str, quantity: int, *, price_rub: float | None = None,
+                           dry_run: bool = False, assume_yes: bool = False) -> int:
+    """Ручная выдача: «покупатель просит вручную» — заказ без сделки на FunPay.
+
+    Полезно, когда оплату приняли в обход автовыдачи (спор/перенос/подарок).
+    Синтетический ID `M-<timestamp>` нужен, чтобы заказ не столкнулся с реальным
+    и чтобы Idempotency-Key GAMEAU был предсказуемым.
+    """
+    from .services.order_processor import process_paid_order
+
+    order_id = f"M-{int(time.time())}"
+    order_data = {
+        "id": order_id,
+        "chat_node": f"manual-{order_id}",
+        "last_message": f"@{username}",
+        "description": f"Ручная выдача {quantity}⭐ @{username}",
+        "quantity": quantity,
+        "price": price_rub if price_rub is not None else 0,
+    }
+    est_usdt = round(quantity / 1000 * cfg.usdt_per_1000_stars, 4)
+    pol = cfg.order_policy()
+    est_rub = round(est_usdt * pol.rate_rub_per_usdt, 2)
+    print(f"Ручная выдача #{order_id}: {format_username(username)} × {quantity}⭐")
+    print(f"  оценка затрат: {est_usdt} USDT ≈ {est_rub:.2f} ₽ "
+          f"(курс {pol.rate_rub_per_usdt:.2f} ₽/USDT)")
+
+    if dry_run:
+        async with open_db(cfg) as db:
+            checks = await evaluate_order_risk(
+                pol, db,
+                order_id=order_id,
+                username=username,
+                quantity=quantity,
+                price_rub=float(price_rub or 0),
+                cost_rub=est_rub,
+                order_cost_usdt=est_usdt,
+            )
+        if checks:
+            print("  политика выдачи говорит:")
+            for check in checks:
+                flag = "⛔" if check.is_hold else "⚠️"
+                print(f"    {flag} {check.code} ({check.action}): {check.reason}")
+        else:
+            print("  политика выдачи: замечаний нет.")
+        print("\n✅ --dry-run: запрос в GAMEAU НЕ отправлялся, деньги не списаны.")
+        return 0
+
+    if not _confirm_or_exit(assume_yes, f"Купить {quantity}⭐ для {format_username(username)} за ~{est_usdt} USDT?"):
+        return 2
+
+    cfg.validate()
+    async with open_db(cfg) as db:
+        funpay, gameau, notifier = build_funpay(cfg), build_gameau(cfg), build_notifier(cfg)
+        try:
+            result = await process_paid_order(
+                order_data=order_data,
+                funpay_client=funpay,
+                gameau_client=gameau,
+                db=db,
+                tg_notifier=notifier,
+                task_tracker=TaskTracker(db),
+                # политику НЕ обходим: «-y» означает «не спрашивай», а не «игнорируй
+                # лимиты». Если что-то заблокировано — заказ уйдёт в HOLD_MANUAL,
+                # и дальше решение за --release.
+                **_order_kwargs(cfg),
+            )
+        finally:
+            await funpay.close()
+            await gameau.close()
+            await notifier.close()
+    print("Результат: " + json.dumps(result, ensure_ascii=False, default=str))
+    return 0 if result.get("status") in ("completed", "unconfirmed") else 1
+
+
+def _parse_order_args(raw: list[str], cfg: Config, price_override: float | None) -> tuple[str, int, float | None]:
+    """`@nick [звёзды]` → (username, quantity, price_rub). Количество по умолчанию — из конфига."""
+    if not raw:
+        raise ValueError("нужно указать @username покупателя")
+    username = str(raw[0]).strip().lstrip("@")
+    if not username:
+        raise ValueError("пустой @username")
+    quantity = int(cfg.default_stars_quantity)
+    if len(raw) > 1:
+        try:
+            quantity = int(float(raw[1]))
+        except (TypeError, ValueError):
+            raise ValueError(f"не понял количество звёзд: {raw[1]!r}") from None
+    if quantity <= 0:
+        raise ValueError("количество звёзд должно быть больше нуля")
+    return username, quantity, price_override
+
+
+def cmd_templates(cfg: Config) -> int:
+    """Шаблоны ответов покупателю: что сейчас действует и чем можно управлять."""
+    from .services.policy import ReplyTemplates
+
+    templates = cfg.reply_templates()
+    placeholders = (
+        "{username} — ник покупателя без @, "
+        "{quantity} — сколько звёзд, {quantity_spaces} — «1 000», "
+        "{order_id} — номер заказа, {price_rub} — выручка ₽, {reason} — причина задержки"
+    )
+    print("Шаблоны ответов в чат FunPay (ENV-ключи в .env / поля в GUI «Ответы покупателю»):\n")
+    for kind, env, title in (
+        ("need_username", "REPLY_NEED_USERNAME", "запрос ника, если он не распознан"),
+        ("delivered", "REPLY_DELIVERED", "звёзды зачислены"),
+        ("hold", "REPLY_HOLD", "заказ задержан политикой (пусто = молчим)"),
+        ("error", "REPLY_ERROR", "выдача не удалась (пусто = молчим)"),
+    ):
+        text = getattr(templates, kind) or ""
+        state = "(пусто → сообщение не отправляется)" if not text else ""
+        print(f"  {env}  {title} {state}")
+        for line in text.splitlines() or [""]:
+            print(f"      {line}" if line else "")
+        print()
+    print(f"Плейсхолдеры: {placeholders}")
+    print("Неизвестный плейсхолдер остаётся в тексте как есть — ответ не рассыпается.")
+    print(f"Значения по умолчанию: {ReplyTemplates().delivered.splitlines()[0][:56]}…")
+    return 0
+
+
+async def cmd_metrics(cfg: Config) -> int:
+    """Тот же снимок, что отдаёт /metrics, — для отладки и cron-проверок."""
+    from .metrics import render_prometheus
+
+    pol = cfg.order_policy()
+    snapshot: dict[str, Any] = {"running": True, "config_ok": not any(i.startswith("missing:") for i in cfg.issues())}
+    async with open_db(cfg) as db:
+        day_start = pol.day_start_ts()
+        with contextlib.suppress(Exception):
+            window = await db.window_stats(start_ts=day_start)
+            counts = await db.get_status_counts()
+            snapshot.update(
+                {
+                    "status_counts": counts,
+                    "today": {
+                        "total": window.get("total", 0),
+                        "revenue_rub": round(float(window.get("revenue_rub") or 0.0), 2),
+                        "cost_usdt": round(float(window.get("cost_usdt") or 0.0), 4),
+                        "profit_rub": round(float(window.get("profit_rub") or 0.0), 2),
+                    },
+                    "limits": {
+                        "spent_usdt": round(await db.sum_cost_usdt_since(day_start), 4),
+                        "limit_usdt": float(cfg.daily_spend_limit_usdt or 0),
+                        "held": int(counts.get("HOLD_MANUAL", 0)),
+                    },
+                    "paused": await bot_control.is_bot_paused(db),
+                }
+            )
+    print(render_prometheus(snapshot), end="")
+    return 0
 
 
 async def cmd_stats_push(cfg: Config) -> int:
@@ -876,7 +1313,71 @@ async def run_bot(cfg: Config, once: bool = False, stop_event: asyncio.Event | N
             tg_task = asyncio.create_task(tg_server.run(stop_event), name="tg-commands")
             logger.info("Интерактивный TG-бот: запущен (/help — список команд)")
 
-        last = {"reconcile": 0.0, "stats_push": 0.0, "chat_monitor": 0.0, "balance": time.time()}
+        # Метрики/healthz — по умолчанию выключены (METRICS_ENABLED=false):
+        # наружу не торчит ничего, а включив, получаем готовый scrape для Prometheus
+        # и /healthz для uptime-мониторинга. Снимок обновляется раз в 15 с, scrape
+        # только читает кэш — база под нагрузкой мониторинга не дрогнет.
+        metrics_cache: dict[str, Any] = {"running": True, "config_ok": True, "status_counts": {}}
+        metrics_server: Any = None
+        if cfg.metrics_enabled:
+            from .metrics import MetricsServer
+
+            try:
+                metrics_server = MetricsServer(
+                    lambda: metrics_cache,
+                    host=cfg.metrics_host,
+                    port=cfg.metrics_port,
+                    token=cfg.metrics_token,
+                )
+                await metrics_server.serve()
+            except ValueError as exc:
+                # наружу без токена — не поднимаем вовсе (конфиг это же ругает в --check)
+                logger.error(f"Метрики выключены: {exc}")
+                metrics_server = None
+            except OSError as exc:
+                logger.warning(f"Метрики не подняты ({cfg.metrics_host}:{cfg.metrics_port}): {exc}")
+                metrics_server = None
+
+        async def refresh_metrics_snapshot() -> None:
+            """Считает снимок для /metrics и /status (ошибки не должны влиять на цикл)."""
+            try:
+                pol = cfg.order_policy()
+                day_start = pol.day_start_ts()
+                window = await db.window_stats(start_ts=day_start)
+                counts = await db.get_status_counts()
+                issues = cfg.issues()
+                metrics_cache.update(
+                    {
+                        "running": True,
+                        "ts": int(time.time()),
+                        "paused": await bot_control.is_bot_paused(db),
+                        "config_ok": not any(i.startswith("missing:") for i in issues),
+                        "issues": issues,
+                        "status_counts": counts,
+                        "today": {
+                            "total": window.get("total", 0),
+                            "revenue_rub": round(float(window.get("revenue_rub") or 0.0), 2),
+                            "cost_usdt": round(float(window.get("cost_usdt") or 0.0), 4),
+                            "profit_rub": round(float(window.get("profit_rub") or 0.0), 2),
+                        },
+                        "limits": {
+                            # считать по sum_cost_usdt_since: суточный лимит
+                            # сравнивается именно со списаниями, а не с себестоимостью
+                            # завершённых заказов (окно window_stats их не включает)
+                            "spent_usdt": round(await db.sum_cost_usdt_since(day_start), 4),
+                            "limit_usdt": float(cfg.daily_spend_limit_usdt or 0),
+                            "held": int(counts.get("HOLD_MANUAL", 0)),
+                        },
+                    }
+                )
+            except Exception as exc:
+                logger.debug(f"Снимок метрик не обновлён: {exc}")
+
+        if metrics_server is not None:
+            await refresh_metrics_snapshot()
+
+        last = {"reconcile": 0.0, "stats_push": 0.0, "chat_monitor": 0.0, "balance": time.time(),
+                "metrics": 0.0}
         stats_push_sec = cfg.stats_push_interval_min * 60.0
         balance_check_sec = cfg.balance_check_interval_min * 60.0
 
@@ -965,9 +1466,20 @@ async def run_bot(cfg: Config, once: bool = False, stop_event: asyncio.Event | N
                     if balance_check_sec > 0 and now - last["balance"] >= balance_check_sec:
                         last["balance"] = now
                         try:
-                            await bot_control.check_gameau_balance(gameau, notifier, cfg.low_balance_threshold_usdt, alert=True)
+                            balance = await bot_control.check_gameau_balance(
+                                gameau, notifier, cfg.low_balance_threshold_usdt, alert=True
+                            )
                         except Exception as exc:
                             logger.error(f"Ошибка проверки баланса GAMEAU: {exc}", exc_info=True)
+
+                    if metrics_server is not None and now - last["metrics"] >= 15.0:
+                        last["metrics"] = now
+                        await refresh_metrics_snapshot()
+                        if balance:
+                            metrics_cache["gameau"] = {
+                                "balance_usdt": balance.get("balance"),
+                                "low_balance": bool(balance.get("low_balance")),
+                            }
 
                 except Exception as exc:
                     logger.error(f"Ошибка в цикле автовыдачи: {exc}", exc_info=True)
@@ -986,6 +1498,10 @@ async def run_bot(cfg: Config, once: bool = False, stop_event: asyncio.Event | N
                     if not task.done():
                         task.cancel()
             stop_event.set()
+            metrics_cache["running"] = False
+            if metrics_server is not None:
+                with contextlib.suppress(Exception):
+                    await metrics_server.stop()
             if tg_task is not None:
                 tg_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1042,6 +1558,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-qty", type=int, default=50, help="звёзд в тестовом заказе (по умолчанию 50)")
     parser.add_argument("--dry-run", action="store_true", help="для --test-order: без покупки в GAMEAU")
     parser.add_argument("-y", "--yes", action="store_true", help="не спрашивать подтверждение для --test-order")
+    parser.add_argument("--held", action="store_true",
+                        help="заказы, задержанные политикой выдачи (ждут решения)")
+    parser.add_argument("--release", metavar="ORDER_ID", default=None,
+                        help="отпустить задержанный заказ и выдать (нужно -y)")
+    parser.add_argument("--cancel", metavar="ORDER_ID", default=None,
+                        help="отклонить задержанный заказ (нужно -y)")
+    parser.add_argument("--note", default="", metavar="TEXT", help="комментарий к --cancel/--blacklist add")
+    parser.add_argument("--order", nargs="+", metavar="ARG",
+                        help="ручная выдача: --order @username [ЗВЁЗДЫ] (без -y не покупает)")
+    parser.add_argument("--order-price", type=float, default=None, metavar="RUB",
+                        help="выручка ₽ для --order (для отчёта и проверки маржи)")
+    parser.add_argument("--limits", action="store_true",
+                        help="политика выдачи: лимиты, суточный бюджет, задержки")
+    parser.add_argument("--blacklist", nargs="*", metavar="ARG",
+                        help="стоп-лист: --blacklist list | add @nick [причина] | remove @nick")
+    parser.add_argument("--customers", action="store_true", help="сводка по покупателям за период")
+    parser.add_argument("--days", type=float, default=7.0, help="период для --customers (суток, по умолчанию 7)")
+    parser.add_argument("--export", metavar="PATH", default=None,
+                        help="выгрузить историю заказов в файл (.csv или .json)")
+    parser.add_argument("--since", default=None, metavar="PERIOD",
+                        help="период выгрузки: 7d, 24h, 2026-09-01..2026-09-07")
+    parser.add_argument("--export-status", default=None, metavar="STATUSES",
+                        help="фильтр по статусам через запятую (COMPLETED,FAILED)")
+    parser.add_argument("--failed", action="store_true", help="в выгрузку — только проблемные заказы")
+    parser.add_argument("--buyer", default=None, metavar="USERNAME", help="в выгрузку — заказы одного покупателя")
+    parser.add_argument("--with-events", action="store_true",
+                        help="выгрузить и хронологию событий вторым файлом")
+    parser.add_argument("--export-limit", type=int, default=0, help="максимум строк в выгрузке (0 = все)")
+    parser.add_argument("--metrics", action="store_true",
+                        help="напечатать снимок метрик в формате Prometheus")
+    parser.add_argument("--templates", action="store_true",
+                        help="текущие шаблоны ответов покупателю и доступные плейсхолдеры")
     parser.add_argument("--config", default=None, metavar="PATH", help="путь к config.json (по умолчанию рядом с exe/проектом)")
     parser.add_argument("-v", "--verbose", action="store_true", help="отладочный уровень логов")
     parser.add_argument("--version", action="version", version=f"AutoStars {__version__}")
@@ -1076,7 +1624,12 @@ def main(argv: list[str] | None = None) -> None:
             "и GAMEAU_API_KEY, затем запустите команду снова."
         )
         print("   Локальные команды (--check, --calc, --config-show) работают уже сейчас.")
-        if not (args.check or args.calc or args.config_show):
+        local_only = (
+            args.check or args.calc or args.config_show or args.templates or args.limits
+            or args.held or args.customers or args.export or args.metrics
+            or (args.blacklist and (len(args.blacklist) == 1 and args.blacklist[0] == "list"))
+        )
+        if not local_only:
             sys.exit(1)
 
     def run(coro: Any) -> int:
@@ -1124,6 +1677,83 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.timeline:
             sys.exit(run(cmd_timeline(cfg, args.timeline)))
+
+        if args.templates:
+            sys.exit(cmd_templates(cfg))
+
+        if args.limits:
+            sys.exit(run(cmd_limits(cfg, as_json=args.json)))
+
+        if args.held:
+            sys.exit(run(cmd_held(cfg, as_json=args.json)))
+
+        if args.customers:
+            sys.exit(run(cmd_customers(cfg, days=args.days, as_json=args.json)))
+
+        if args.blacklist:
+            argv = [str(a) for a in args.blacklist]
+            action = (argv[0] or "list").lower()
+            if action not in ("list", "add", "remove", "rm"):
+                print(f"[ERR] Не понимаю «{action}»: нужно list | add @nick | remove @nick")
+                sys.exit(1)
+            user = argv[1] if len(argv) > 1 else None
+            note = " ".join(argv[2:]) if len(argv) > 2 else args.note
+            sys.exit(run(cmd_blacklist(cfg, action, user, note=note, as_json=args.json)))
+
+        if args.export:
+            fmt = "json" if str(args.export).lower().endswith(".json") else "csv"
+            try:
+                sys.exit(
+                    run(
+                        cmd_export(
+                            cfg,
+                            args.export,
+                            fmt=fmt,
+                            period=args.since,
+                            status=args.export_status,
+                            failed=args.failed,
+                            buyer=args.buyer,
+                            events=args.with_events,
+                            limit=args.export_limit,
+                            as_json=args.json,
+                        )
+                    )
+                )
+            except ValueError as exc:
+                print(f"[ERR] {exc}")
+                sys.exit(1)
+
+        if args.release:
+            try:
+                sys.exit(run(cmd_release(cfg, args.release, assume_yes=args.yes, as_json=args.json)))
+            except ValueError as exc:
+                print(f"[ERR] {exc}")
+                sys.exit(1)
+
+        if args.cancel:
+            sys.exit(run(cmd_cancel_held(cfg, args.cancel, note=args.note, assume_yes=args.yes)))
+
+        if args.metrics:
+            sys.exit(run(cmd_metrics(cfg)))
+
+        if args.order:
+            try:
+                user, qty, price = _parse_order_args(args.order, cfg, args.order_price)
+            except ValueError as exc:
+                print(f"[ERR] {exc}\nИспользование: --order @username [ЗВЁЗДЫ]")
+                sys.exit(1)
+            sys.exit(
+                run(
+                    cmd_manual_order(
+                        cfg,
+                        user,
+                        qty,
+                        price_rub=price,
+                        dry_run=args.dry_run,
+                        assume_yes=args.yes,
+                    )
+                )
+            )
 
         if args.stats_push:
             sys.exit(run(cmd_stats_push(cfg)))

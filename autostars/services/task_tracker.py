@@ -25,6 +25,8 @@ EV_STUCK_ALERTED = "STUCK_ALERTED"       # разовый алерт о зави
 EV_COMPLETED = "COMPLETED"               # задача закрыта успешно
 EV_FAILED = "FAILED"                     # задача закрыта с ошибкой
 EV_CANCELLED = "CANCELLED"               # заказ отменён
+EV_RISK_HOLD = "RISK_HOLD"               # заказ задержан политикой выдачи (ждёт человека)
+EV_RISK_ALERT = "RISK_ALERT"             # политика сработала, но выдача продолжилась
 
 
 class TaskTracker:
@@ -40,6 +42,10 @@ class TaskTracker:
             logger.info(f"[TASK {order_id}] {event}" + (f" | {detail}" if detail else ""))
         except Exception as exc:  # трекер не должен ронять пайплайн
             logger.warning(f"Не удалось записать событие {event} по {order_id}: {exc}")
+
+    async def held_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Заказы, задержанные политикой выдачи и ждущие решения человека."""
+        return await self.db.get_orders_by_status(("HOLD_MANUAL",), limit=limit)
 
     async def timeline(self, order_id: str) -> list[dict[str, Any]]:
         """Полная история выполнения задачи по заказу."""

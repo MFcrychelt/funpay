@@ -21,7 +21,7 @@ git add .github/workflows/ci.yml && git commit -m "ci: включить GitHub A
 
 | Джоба | Проверки | Блокирует merge? |
 |---|---|---|
-| `core` | `pip install -e ".[dev]"` → ruff, `compileall`, `pytest -q` (154 теста), смоук CLI (`--calc`, `--config-show`, `--stats --json`, guard `--test-order`), `check_env.py`, `tools/check_docs_links.py` — на Python 3.10/3.11/3.12 | да |
+| `core` | `pip install -e ".[dev]"` → ruff, `compileall`, `pytest -q` (247 тестов), смоук CLI (`--calc`, `--config-show`, `--stats --json`, guard `--test-order`), `check_env.py`, `tools/check_docs_links.py` — на Python 3.10/3.11/3.12 | да |
 | `gui` | установка `.[gui,dev]`, `tools/gui_smoke.py` (окно не открывается), `pytest tests/test_gui_bridge.py tests/test_gui_settings.py` | да |
 | `legacy` | `pytest legacy/tests` c `FunPayAPI --no-deps` | нет (`continue-on-error`) |
 | `docker` | `docker build` + `--help` внутри образа | да |

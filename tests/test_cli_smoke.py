@@ -245,3 +245,105 @@ def test_catalog_and_balance_report_errors_without_traceback(home):
         out = result.stdout + result.stderr
         assert "Traceback" not in out, out[-800:]
         assert "GAMEAU" in out or "FunPay" in out
+
+
+# ============================================================================ #
+# v2.4: политика выдачи, ручная выдача, стоп-лист, выгрузка, метрики
+# ============================================================================ #
+
+V24_FLAGS = ("--held", "--release", "--cancel", "--order", "--limits", "--blacklist",
+             "--customers", "--export", "--since", "--metrics", "--templates", "--with-events")
+
+
+def test_help_lists_v24_flags(home):
+    result = run_cli("--help", home=home)
+    assert result.returncode == 0
+    missing = [flag for flag in V24_FLAGS if flag not in result.stdout]
+    assert not missing, f"в --help нет флагов {missing}"
+
+
+def test_local_policy_commands_run_without_keys(tmp_path):
+    """Локальные команды (БД + конфиг) не требуют боевых ключей и не падают."""
+    (tmp_path / ".env").write_text("POLL_INTERVAL=5\nDAILY_SPEND_LIMIT_USDT=500\n", encoding="utf-8")
+    for args in (("--limits",), ("--held",), ("--templates",), ("--customers",), ("--blacklist", "list")):
+        result = run_cli(*args, home=tmp_path, base=False,
+                         env={"FUNPAY_GOLDEN_KEY": "", "GAMEAU_API_KEY": ""})
+        out = result.stdout + result.stderr
+        assert result.returncode == 0, f"{args}: {out[-500:]}"
+        assert "Traceback" not in out
+
+
+def test_limits_json_shape(home):
+    result = run_cli("--limits", "--json", home=home,
+                     env={"MAX_ORDER_REVENUE_RUB": "4000", "MIN_MARGIN_PCT": "18"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["limits"]["max_order_revenue_rub"] == 4000.0
+    assert payload["limits"]["min_margin_pct"] == 18.0
+    assert payload["spent_today_usdt"] == 0.0
+    assert payload["held"] == 0
+
+
+def test_release_and_cancel_refuse_without_confirmation(home):
+    """Опасные команды обязаны тормозить: нет заказа → 1, нет -y → 2, и всегда без трейсбека."""
+    for args in (("--release", "NOPE"), ("--cancel", "NOPE")):
+        result = run_cli(*args, home=home)
+        out = result.stdout + result.stderr
+        assert "Traceback" not in out, out[-500:]
+        assert result.returncode in (1, 2), f"{args}: {out[-300:]}"
+
+
+def test_manual_order_dry_run_is_free(home):
+    result = run_cli("--order", "@someone", "1500", "--dry-run", home=home)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "Ручная выдача" in out
+    assert "1 500" in out or "1500" in out, out[-300:]
+    assert "НЕ отправлялся" in out
+
+
+def test_manual_order_without_confirmation_is_refused(home):
+    result = run_cli("--order", "@someone", home=home, env={"DEFAULT_STARS_QUANTITY": "1000"})
+    out = result.stdout + result.stderr
+    assert result.returncode in (1, 2), out[-400:]
+    assert "Traceback" not in out
+
+
+def test_blacklist_roundtrip_via_cli(home):
+    assert run_cli("--blacklist", "add", "@spammer", "спам", "в", "личке", home=home).returncode == 0
+    listing = run_cli("--blacklist", "list", "--json", home=home)
+    rows = json.loads(listing.stdout)
+    assert [r["username"] for r in rows] == ["@spammer"]
+    assert rows[0]["note"] == "спам в личке"
+    assert run_cli("--blacklist", "remove", "spammer", home=home).returncode == 0
+    assert json.loads(run_cli("--blacklist", "list", "--json", home=home).stdout) == []
+
+
+def test_export_creates_csv_and_json(home, tmp_path):
+    csv_path = tmp_path / "dump.csv"
+    result = run_cli("--export", str(csv_path), home=home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert csv_path.exists()
+    text = csv_path.read_text(encoding="utf-8-sig")
+    assert text.splitlines()[0].startswith("order_id,status,username")
+    assert "Выгружено 0 заказов" in result.stdout
+
+    json_path = tmp_path / "dump.json"
+    assert run_cli("--export", str(json_path), "--json", home=home).returncode == 0
+    assert json.loads(json_path.read_text(encoding="utf-8")) == []
+
+
+def test_export_bad_period_reports_human_error(home, tmp_path):
+    result = run_cli("--export", str(tmp_path / "x.csv"), "--since", "на прошлой неделе", home=home)
+    assert result.returncode == 1
+    out = result.stdout + result.stderr
+    assert "не понял период" in out and "Traceback" not in out
+
+
+def test_metrics_snapshot_is_prometheus(home):
+    result = run_cli("--metrics", home=home)
+    assert result.returncode == 0, result.stdout + result.stderr
+    text = result.stdout
+    assert "autostars_up 1" in text
+    assert "# TYPE autostars_orders_total gauge" in text
+    assert "autostars_daily_spend_limit_usdt 0" in text

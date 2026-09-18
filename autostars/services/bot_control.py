@@ -56,6 +56,7 @@ async def process_waiting_username_orders(
     limit: int = 20,
     usdt_per_1000_stars: float = 9.10,
     max_charge_margin_pct: float = 5.0,
+    policy: Any = None,
 ) -> int:
     """
     Проходит по заказам в статусе WAITING_USERNAME и смотрит последнее
@@ -111,6 +112,7 @@ async def process_waiting_username_orders(
                 usdt_per_1000_stars=usdt_per_1000_stars,
                 max_charge_margin_pct=max_charge_margin_pct,
                 bypass_processed_check=True,
+                policy=policy,
             )
             started += 1
         except Exception as exc:
@@ -137,9 +139,13 @@ async def retry_failed_order(
     wait_completion_timeout: float = 120.0,
     usdt_per_1000_stars: float = 9.10,
     max_charge_margin_pct: float = 5.0,
+    policy: Any = None,
+    ignore_policy: bool = False,
 ) -> dict[str, Any]:
     """
-    Повторяет выдачу проваленного заказа (FAILED*). Идемпотентно:
+    Повторяет выдачу проваленного или задержанного (HOLD_MANUAL) заказа.
+
+    Идемпотентно:
     Idempotency-Key детерминирован по order_id, поэтому дубль покупки в GAMEAU
     невозможен — API вернёт тот же заказ, если он был создан ранее.
     """
@@ -153,7 +159,7 @@ async def retry_failed_order(
             "status": "not_retryable",
             "order_id": order_id,
             "current_status": current,
-            "hint": "ретрай доступен для FAILED / FAILED_LOW_BALANCE / "
+            "hint": "ретрай доступен для HOLD_MANUAL / FAILED / FAILED_LOW_BALANCE / "
                     "FAILED_PRICE_EXCEEDED / FAILED_DELIVERY / CANCELLED",
         }
 
@@ -190,6 +196,8 @@ async def retry_failed_order(
         usdt_per_1000_stars=usdt_per_1000_stars,
         max_charge_margin_pct=max_charge_margin_pct,
         bypass_processed_check=True,
+        policy=policy,
+        ignore_policy=ignore_policy,
     )
 
 

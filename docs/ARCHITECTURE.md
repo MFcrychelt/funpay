@@ -14,8 +14,10 @@
                                    ▼                                  │ subprocess/SQLite/.env
                     ┌───────────────────────────────────────────────────┐
                     │            движок (единый для всех оболочек)        │
-                    │  services/order_processor · bot_control ·          │
-                    │  task_tracker · statistics · parser                 │
+                    │  services/order_processor · policy · export ·       │
+                    │  bot_control · task_tracker · statistics · parser   │
+                    ├─────────────────────────────────────────────────────┤
+                    │  notifier/tg_alert · tg_commands   metrics (опц.)   │
                     └───────────────┬───────────────────┬─────────────────┘
                                     ▼                   ▼
                     ┌───────────────────────┐ ┌───────────────────────────┐
@@ -38,6 +40,9 @@
 | `clients/funpay.py` | HTML/CSRF/long polling/чат FunPay | знать про GAMEAU и про статистику |
 | `clients/gameau.py` | каталог, покупка, статусы, баланс, `Idempotency-Key`, `maxCharge` | писать в БД |
 | `services/order_processor.py` | пайплайн одного заказа, ретраи, ответ покупателю | заводить свой цикл/таймеры |
+| `services/policy.py` | решения «покупать ли»: лимиты, дубли, стоп-лист; шаблоны ответов; текст алерта владельцу | ходиться в сеть (данные приходят аргументами, БД — через `db`) |
+| `services/export.py` | форматы выгрузки (CSV/JSON), парсинг периода, сводка | SQL (запросы — у `DBManager.select_orders`) |
+| `autostars/metrics.py` | `/metrics`, `/healthz`, `/status` (свой HTTP на asyncio) | читать БД напрямую (получает снимок), принимать что-то кроме GET |
 | `services/task_tracker.py` | журнал событий, зависшие, reconciliation | решать, выдать ли деньги повторно |
 | `services/statistics.py` | окна, P&L, отчёты, JSON/TXT | менять статусы заказов |
 | `services/bot_control.py` | пауза/резюм, баланс, флаги в БД | — |
@@ -112,6 +117,12 @@ parser: @username / t.me/… + количество (иначе DEFAULT_STARS_QU
    │
 maxCharge = max(DEFAULT_MAX_CHARGE_USDT, price × (1 + MAX_CHARGE_MARGIN_PCT/100))
    │
+политика выдачи (services/policy.py, если включена): лимит сделки, маржа,
+   │  суточный бюджет USDT, дубль за DUPLICATE_WINDOW_MIN, стоп-лист buyer_flags
+   ├── есть hold → save_order_status(HOLD_MANUAL, error="CODE: причина") +
+   │              EV_RISK_HOLD + критичный TG-алерт (+ REPLY_HOLD покупателю) → Стоп
+   └── только alert → EV_RISK_ALERT + TG-алерт (некритичный) → идем дальше
+   │
 POST /telegramStars  (Idempotency-Key = uuid5(namespace, order_id))
    ├── 409 PRICE_CHANGED → FAILED_PRICE_EXCEEDED, деньги не списаны, алерт
    ├── 429/5xx/timeout  → до MAX_ORDER_RETRIES повторов (тот же ключ идемпотентности)
@@ -119,8 +130,13 @@ POST /telegramStars  (Idempotency-Key = uuid5(namespace, order_id))
    │
 chargedAmount → cost_usdt/cost_rub/profit_rub (факт, не прогноз)
    │
-ответ покупателю в чат FunPay → TG-алерт с прибылью по обоим курсам → COMPLETED
+ответ покупателю в чат FunPay (REPLY_DELIVERED) → TG-алерт с прибылью по обоим
+курсам (в «тихие часы» — он молчит) → COMPLETED
 ```
+
+Провал выдачи (`GAMEAU_DELIVERY_FAILED`, `LOW_BALANCE`, `PRICE_EXCEEDED`) тоже
+отвечает покупателю — но только если `REPLY_ERROR` непустой: обещание возврата в
+чате = публичное обязательство, поэтому по умолчанию там пусто.
 
 Параллельно в цикле (`main.run_bot`):
 
@@ -132,7 +148,10 @@ chargedAmount → cost_usdt/cost_rub/profit_rub (факт, не прогноз)
 - **баланс**: каждые `BALANCE_CHECK_INTERVAL_MIN`, ниже `LOW_BALANCE_THRESHOLD_USDT`
   → алерт;
 - **периодическая статистика**: `STATS_PUSH_INTERVAL_MIN` (0 — выкл);
-- **TG-команды владельца**: long polling `getUpdates`.
+- **TG-команды владельца**: long polling `getUpdates`;
+- **снимок метрик** (если `METRICS_ENABLED=true`): раз в 15 с пересобирается из БД и
+  конфигурации в `metrics_cache`, HTTP-сервер отдаёт только кэш — scrape не создаёт
+  нагрузки на базу и не может замедлить выдачу.
 
 Каждый заказ — отдельная asyncio-задача, не более `MAX_CONCURRENT_ORDERS`
 одновременно (семафор).
@@ -145,6 +164,7 @@ chargedAmount → cost_usdt/cost_rub/profit_rub (факт, не прогноз)
 | `task_events` | журнал жизненного цикла (для `--tasks`, `--timeline`, детектора зависших) | `idx_task_events_order`, `idx_task_events_ts` |
 | `idempotency_keys` / `idempotency_logs` | ключ покупки → заказ, запрос/ответ | PK `idempotency_key` |
 | `settings` | флаги цикла (`bot_paused`) и служебные значения | PK `key` |
+| `buyer_flags` | стоп-лист покупателей: `username` (с `@`), `kind`, `note`, `created_ts` | PK `(username, kind)`; ищется по `username` |
 
 SQLite-драйвер — `aiosqlite`: запросы исполняет отдельный демонский поток, чтобы
 медленный диск (или антивирус на Windows) не блокировал event loop.
@@ -152,7 +172,16 @@ SQLite-драйвер — `aiosqlite`: запросы исполняет отд�
 Статусы заказа (`db_manager`): в работе — `PROCESSING`, `WAITING_USERNAME`;
 успех — `COMPLETED`; провал — `FAILED`, `FAILED_LOW_BALANCE`,
 `FAILED_PRICE_EXCEEDED`, `FAILED_DELIVERY`, `CANCELLED` (префикс `FAILED` —
-сигнал для `--retry-order`, TG `/retry` и статистики провалов). Статусы
+сигнал для `--retry-order`, TG `/retry` и статистики провалов); ожидание человека —
+`HOLD_MANUAL` (`HOLD_STATUSES`: не провал и не «в работе», входит в
+`RETRYABLE_STATUSES` и в `--export --failed`).
+
+Почему `HOLD_MANUAL` — это отдельный статус, а не `FAILED` и не «в работе»:
+оплата на FunPay уже получена (отсюда и `RETRYABLE`), но `FAILED` испортил бы
+статистику провалов, а `IN_PROGRESS_STATUSES` — заставил бы reconciliation каждые
+`STUCK_TASK_MINUTES` кричать «задача зависла» на каждый задержанный заказ.
+
+Статусы
 `RECEIVED`, `PACKAGE_SELECTED`, `FUNPAY_REPLY`, … — это **события** журнала
 `task_events`, а не состояния заказа: по ним строится `--timeline`.
 
@@ -205,6 +234,15 @@ SQLite-драйвер — `aiosqlite`: запросы исполняет отд�
 4. **Ни один секрет не попадает в вывод**: логи, алерты, `--config-show`, GUI-форма.
 5. **GUI не меняет состояние движка иначе как через CLI/`.env`** — иначе
    расхождение «в окне одно, в консоли другое» неизбежно.
+6. **Проверки политики считаются до запроса в GAMEAU, а не после.** Списанные USDT
+   обратно не вернуть; `hold` = «не покупаем», а «что делать с заказом» решает
+   человек (`--release`/`--cancel`). Обход политики разрешён только явным
+   `ignore_policy` из ручных команд (`--release`, `/release`) — автоматический путь
+   его никогда не включает.
+7. **Задержанный заказ не считается провалом и не считается зависшим** (см. §6):
+   `HOLD_MANUAL` вне `IN_PROGRESS_STATUSES` и вне префикса `FAILED`.
+8. **Метрики не включают бизнес-логики**: снимок считает цикл и отдаёт кэш; сервер
+   слушает localhost и выключен по умолчанию (см. `docs/SECURITY.md`, §7).
 
 ## 10. Границы модели
 

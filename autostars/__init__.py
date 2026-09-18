@@ -19,7 +19,7 @@ import contextlib
 
 __all__ = ["__version__"]
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 with contextlib.suppress(Exception):  # версия из упаковки (pip install -e .)
     from importlib.metadata import version as _pkg_version

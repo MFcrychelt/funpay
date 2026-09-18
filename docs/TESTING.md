@@ -5,7 +5,7 @@
 ```bash
 pip install -e ".[dev]"          # pytest, anyio, pytest-timeout, ruff
 
-python -m pytest -q                     # 154 теста: движок + CLI + GUI-мост + конфигурация
+python -m pytest -q                     # 247 тестов: движок + CLI + GUI-мост + конфигурация
 python -m pytest tests/test_config.py -q      # один файл
 python -m pytest tests/test_gui_bridge.py::test_engine_process_start_stop -q
 python -m pytest -q -k "not smoke"          # без долгого (CLI-смоук спавнит процессы)
@@ -23,8 +23,9 @@ python -m compileall -q autostars    # синтаксис под целевую 
 
 ## 2. Карта тестов
 
-По файлам (154 теста): `test_autostars` 38 · `test_config` 24 · `test_cli_smoke` 19 ·
-`test_v22` 18 · `test_gui_bridge` 13 · `test_statistics` 13 · `test_gui_settings` 12 ·
+По файлам (247 тестов): `test_autostars` 38 · `test_risk` 35 · `test_cli_smoke` 29 ·
+`test_export_metrics` 25 · `test_config` 24 · `test_templates` 19 · `test_v22` 18 ·
+`test_gui_bridge` 13 · `test_statistics` 13 · `test_gui_settings` 12 ·
 `test_security_paths` 11 · `test_config_drift` 6.
 
 | Файл | Что охраняет | Ключевые проверки |
@@ -37,6 +38,9 @@ python -m compileall -q autostars    # синтаксис под целевую 
 | `tests/test_v22.py` | «отзывчивость» 2.2 | чат-мониторинг, персистентные соединения, защита от повторной обработки, TG-сервер команд (allowlist, dispatch) |
 | `tests/test_cli_smoke.py` | интерфейс командной строки | реальный `python -m autostars.main` в изолированной папке: коды возврата, `--json`, `--config-show` без секретов, `--pause/--resume` пишут в БД, `--test-order` без `-y` не запускается, первый запуск создаёт `.env` и не притворяется успехом |
 | `tests/test_gui_bridge.py` | мост GUI ↔ движок | команда строится правильно (исходники/exe), разовые команды выполняются, `EngineProcess` запускает/останавливает реальный процесс и собирает логи, чтение БД не пишет в неё, старые схемы базы не роняют GUI |
+| `tests/test_risk.py` | политика выдачи (2.4) | лимиты/маржа/суточный бюджет считаются до покупки; дубль по окну и количеству; стоп-лист; `HOLD_MANUAL` ≠ провал и ≠ «зависшая»; `ignore_policy` и ретрай задержанного; `--limits/--held/--cancel/--release/-y`; TG `/limits /held /release /blacklist /customers` |
+| `tests/test_templates.py` | шаблоны ответов (2.4) | дефолты = прежние тексты байт в байт; `{плейсхолдер}` и неизвестный ключ; многострочные значения в `.env`; пустой шаблон = молчим; round-trip через редактор GUI; запрет неизвестного `{...}` в форме |
+| `tests/test_export_metrics.py` | выгрузка и метрики (2.4) | `parse_period` (7d/24h/даты/диапазон/мусор), CSV: BOM+CRLF+кавычки, фильтры `--since/--failed/--buyer/--with-events`, атомарная запись; `render_prometheus` (лейблы, отсутствующие значения); живой HTTP-сервер на 127.0.0.1: `/metrics`, `/healthz` (200/503), `/status`, 401 с токеном, 405/404 и устойчивость к битому запросу |
 | `tests/test_gui_settings.py` | редактор настроек | валидация чисел/диапазонов/выборов, сохранение комментариев и порядка, `.env.bak` только при реальном изменении, секрет не затирается пустым полем, все ключи примера имеют поле |
 | `legacy/tests/*` | исторический код | синхронный `bot/`: история, парсер, состояние, `db.json` — бегают «как есть» |
 
@@ -93,7 +97,7 @@ python -m pytest legacy/tests -q
 
 - `bridge.py` и `settings.py` — чистая логика, тесты гоняются без flet;
 - `app.py` — виджеты; его собирает `tools/gui_smoke.py`: строит все вкладки,
-  прогоняет рендер таблиц/статуса, собирает и валидирует значения 38 полей
+  прогоняет рендер таблиц/статуса/вкладки «Выдача», собирает и валидирует значения 53 полей
   настроек. Падение — значит «пользователь увидит пустое окно или Traceback».
 
 Локально полный прогон:

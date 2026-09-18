@@ -86,7 +86,7 @@ class MockNotifier:
         r = rate or self.current_rate
         return round(order_price_rub - (usdt_cost * r), 2)
 
-    async def send_alert(self, text, parse_mode="HTML"):
+    async def send_alert(self, text, parse_mode="HTML", *, critical=True):
         self.alerts.append(text)
         return True
 
@@ -470,7 +470,7 @@ async def test_stats_report_split_long_message():
     notifier = TelegramNotifier(bot_token="T", chat_id="1")
     captured = []
 
-    async def fake_send(text, parse_mode="HTML"):
+    async def fake_send(text, parse_mode="HTML", *, critical=True):
         captured.append(text)
         return True
 

@@ -20,7 +20,7 @@ AUTOSTARS_HOME=/tmp/autostars-dev autostars --check
 ## 2. Команды, которые должен проходить коммит
 
 ```bash
-python -m pytest -q                      # 154 теста ядра/CLI/GUI-моста/настроек
+python -m pytest -q                      # 247 тестов: ядро/политика/CLI/GUI-мост/настройки
 python -m pytest legacy/tests -q          # 45 тестов legacy (свои зависимости)
 python -m ruff check autostars tests tools check_env.py
 python tools/gui_smoke.py                 # интерфейс собирается без ошибок (headless)

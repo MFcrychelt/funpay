@@ -51,6 +51,8 @@ class WindowStats:
     failed: int = 0
     in_progress: int = 0
     waiting_username: int = 0
+    #: задержано политикой выдачи и ждёт решения человека
+    held: int = 0
     stars: int = 0
     revenue_rub: float = 0.0
     cost_usdt: float = 0.0
@@ -84,6 +86,7 @@ class WindowStats:
             "orders_failed": self.failed,
             "orders_in_progress": self.in_progress,
             "orders_waiting_username": self.waiting_username,
+            "orders_held": self.held,
             "stars": self.stars,
             "revenue_rub": round(self.revenue_rub, 2),
             "cost_usdt": round(self.cost_usdt, 4),
@@ -141,6 +144,7 @@ class StatisticsService:
             failed=int(raw.get("failed") or 0),
             in_progress=int(raw.get("in_progress") or 0),
             waiting_username=int(raw.get("waiting_username") or 0),
+            held=int(raw.get("held") or 0),
             stars=int(raw.get("stars") or 0),
             revenue_rub=round(float(raw.get("revenue_rub") or 0.0), 2),
             cost_usdt=round(float(raw.get("cost_usdt") or 0.0), 4),
@@ -300,7 +304,9 @@ class StatisticsService:
             emoji = "🟢" if w.profit_rub >= 0 else "🔴"
             blocks.append(
                 f"\n{emoji} <b>{label}</b> — заказов: {w.total} "
-                f"(✔ {w.completed}, ✖ {w.failed}, ⏳ {w.in_progress})"
+                f"(✔ {w.completed}, ✖ {w.failed}, ⏳ {w.in_progress}"
+                + (f", ⛔ задержано {w.held}" if w.held else "")
+                + ")"
             )
             blocks.append(
                 f"   ⭐ Звёзды: {w.stars:,}".replace(",", " ")

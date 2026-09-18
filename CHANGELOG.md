@@ -3,6 +3,80 @@
 Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версия —
 [SemVer](https://semver.org/lang/ru/). Дата релиза — дата коммита в `main`.
 
+## [2.4.0] — 2026-09-18
+
+Функционал, а не только гигиена: движок научился решать «не покупать», говорить с
+покупателем настраиваемыми текстами, отдавать историю наружу и показывать состояние
+мониторингу. Всё — с тестами (247) и без новых зависимостей.
+
+### Добавлено
+
+- **Политика выдачи (`autostars/services/policy.py`)** — проверки считаются **до**
+  запроса в GAMEAU (списанные USDT обратно не вернуть), итог — `ignore` / `alert` /
+  `hold`:
+  `MAX_ORDER_REVENUE_RUB` (крупная сделка), `MIN_MARGIN_PCT` (маржа по активному
+  курсу), `DAILY_SPEND_LIMIT_USDT` (суточный бюджет закупки), `DUPLICATE_WINDOW_MIN` +
+  `DUPLICATE_ACTION` (тот же ник и количество в окне), `BLACKLIST_ENABLED`
+  (стоп-лист `buyer_flags`).
+- **Статус `HOLD_MANUAL`** — задержанный заказ: не провал (статистика не врёт) и не
+  «в работе» (reconciliation не поднимает «зависшая задача» каждые `STUCK_TASK_MINUTES`);
+ входит в `--export --failed`, виден отдельной строкой «⛔ задержано N» в `--stats`.
+- **Ручные операции**: `--held`, `--release <ID> -y` (выдать вопреки политике, через
+  тот же пайплайн и с тем же `Idempotency-Key`), `--cancel <ID> -y [--note]`,
+  `--order @nick [звёзды] [--dry-run] [-y]` — выдача вне сделки FunPay,
+  `--limits [--json]`, `--customers [--days N]`,
+  `--blacklist list|add @nick [причина]|remove @nick`.
+- **Шаблоны ответов покупателю** — `REPLY_NEED_USERNAME`, `REPLY_DELIVERED`,
+  `REPLY_HOLD`, `REPLY_ERROR` (пусто = не отправляем). Подстановки `{username}`,
+  `{quantity}`, `{quantity_spaces}`, `{order_id}`, `{price_rub}`, `{reason}`;
+  неизвестный ключ остаётся в тексте и ничего не ломает. Значения по умолчанию
+  совпадают с текстами, которые движок писал раньше, поэтому переписка не меняется.
+- **Выгрузка истории** — `--export файл.csv|json` с `--since 7d|24h|2026-09-01..2026-09-07`,
+  `--failed`, `--buyer @nick`, `--export-status`, `--with-events`, `--export-limit`;
+  CSV — `utf-8-sig` + CRLF (открывается в Excel), запись атомарная, SQL — в
+  `DBManager.select_orders`, форматирование — в `services/export.py`.
+- **Метрики** (`autostars/metrics.py`) — `GET /metrics` (Prometheus-текст), `/healthz`
+  (503 при проблемах конфигурации), `/status` (JSON): свой лёгкий HTTP-сервер на
+  `asyncio`, зависимости не добавлены; снимок пересчитывается раз в 15 с, scrape
+  читает кэш. По умолчанию `METRICS_ENABLED=false` и `METRICS_HOST=127.0.0.1`;
+  доступ извне — только через reverse-proxy с `METRICS_TOKEN`. CLI: `--metrics`.
+- **«Тихие часы» (`MUTE_HOURS=23-07`)** — некритичные уведомления (успешная сделка,
+  плановая статистика) в окне не отправляются; ошибки, низкий баланс, задержки и
+  остановка цикла проходят всегда.
+- **Telegram-команды**: `/limits`, `/held`, `/release <id>`, `/blacklist [add|remove
+  @nick]`, `/customers [дней]` — те же обработчики, что у CLI (общие сервисы).
+- **GUI**: вкладка «Выдача» (расход с полуночи против лимита, список задержанных с
+  кнопками «отпустить»/«отклонить» — обе по второму клику, стоп-лист, выгрузка CSV),
+  53 поля настроек (было 38): новая секция «Политика выдачи» и «Ответы покупателю»
+  с многострочными полями; редактор `.env` экранирует переносы шаблонов и не даёт
+  неизвестный `{плейсхолдер}`.
+- **БД**: таблица `buyer_flags` (стоп-лист) + методы `add/remove/list/is_buyer_flagged`,
+  `sum_cost_usdt_since`, `find_recent_order_by_username`, `buyer_stats`, `select_orders`;
+  в оконной агрегат — счётчик `held`.
+- **Тесты**: `tests/test_risk.py` (35), `tests/test_templates.py` (19),
+  `tests/test_export_metrics.py` (25), +10 к CLI-смоуку → **243** теста.
+
+### Изменено
+
+- `.env.example` / `config.example.json` описывают все новые ключи; расхождение
+  «пример ↔ `Config` ↔ поля GUI» по-прежнему ловит `tests/test_config_drift.py`.
+- Ответ покупателю при успехе и при провале выдачи больше не зашит в код — он идёт из
+  шаблона; при пустом шаблоне сообщение не отправляется (и в логе видно почему).
+- `RETRYABLE_STATUSES` теперь включает `HOLD_MANUAL`, `parse_env_text` понимает
+  многострочные значения в двойных кавычках (`\n`) и не режет `#` внутри них.
+- `--help`, `README.md`, `FEATURES.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`,
+  `docs/TESTING.md` описывают новые команды, статусы и границу «метрики — порт на
+  localhost».
+
+### Совместимость
+
+- `.env`, `config.json` и `autostars.db` из 2.3 подходят как есть: новые колонки и
+  таблица `buyer_flags` создаются миграцией при первом запуске, все новые проверки
+  по умолчанию выключены (`0`/`false`), поведение пайплайна без политики идентично 2.3
+  (это закреплено тестом).
+- `HOLD_MANUAL` — новый статус: если у вас были внешние отчёты по статусам, добавьте
+  его в «не провалы».
+
 ## [2.3.0] — 2026-09-18
 
 Ревизия проекта по образцу гигиены референса: один поддерживаемый путь запуска,
@@ -50,7 +124,7 @@
   `.env`/БД), `test_config.py`, `test_config_drift.py` (расхождение
   `.env.example` ↔ `Config` ↔ полей GUI теперь падает), `test_security_paths.py`,
   `test_gui_bridge.py` (реальный subprocess: запуск, логи, остановка),
-  `test_gui_settings.py`, `test_cli_smoke.py` (19 проверок CLI). Итого 154 теста ядра
+  `test_gui_settings.py`, `test_cli_smoke.py` (19 проверок CLI). Итого 247 тестов ядра
   и интерфейса против 69 до правки.
 - **Документация**: переписаны `README.md`, `FEATURES.md`, `INSTALL.md`; добавлены
   `CHANGELOG.md`, `CONTRIBUTING.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`,

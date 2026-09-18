@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -100,10 +101,15 @@ def parse_env_text(text: str) -> dict[str, str]:
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
-        if value[:1] in ('"', "'") and value[-1:] == value[:1] and len(value) >= 2:
+        quote = value[:1]
+        if quote in ('"', "'") and value[-1:] == quote and len(value) >= 2:
             value = value[1:-1]
-        else:
-            # снимаете inline-комментарий вида: KEY=5  # пояснение
+            if quote == '"':
+                # двойные кавычки: экранирование работает, как в python-dotenv —
+                # иначе многострочные шаблоны ответов было не записать
+                value = value.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+        elif "#" in value:
+            # inline-комментарий вида KEY=5  # пояснение (в кавычках — не трогаем)
             for marker in (" #", "\t#"):
                 if marker in value:
                     value = value.split(marker, 1)[0].strip()
@@ -209,6 +215,22 @@ ENV_MAP: dict[str, str] = {
     "STATS_PUSH_INTERVAL_MIN": "stats_push_interval_min",
     "MAX_CONCURRENT_ORDERS": "max_concurrent_orders",
     "SHUTDOWN_TIMEOUT_SEC": "shutdown_timeout",
+    # политика выдачи
+    "MAX_ORDER_REVENUE_RUB": "max_order_revenue_rub",
+    "MIN_MARGIN_PCT": "min_margin_pct",
+    "DAILY_SPEND_LIMIT_USDT": "daily_spend_limit_usdt",
+    "DUPLICATE_WINDOW_MIN": "duplicate_window_min",
+    "DUPLICATE_ACTION": "duplicate_action",
+    "BLACKLIST_ENABLED": "blacklist_enabled",
+    "REPLY_NEED_USERNAME": "reply_need_username",
+    "REPLY_DELIVERED": "reply_delivered",
+    "REPLY_HOLD": "reply_hold",
+    "REPLY_ERROR": "reply_error",
+    "MUTE_HOURS": "mute_hours",
+    "METRICS_ENABLED": "metrics_enabled",
+    "METRICS_HOST": "metrics_host",
+    "METRICS_PORT": "metrics_port",
+    "METRICS_TOKEN": "metrics_token",
     # хранилище / логи
     "DB_PATH": "db_path",
     "LOG_FILE": "log_file",
@@ -289,6 +311,38 @@ class Config:
     max_concurrent_orders: int = 4
     # сколько секунд при остановке ждать завершения начатых выдач
     shutdown_timeout: float = 30.0
+
+    # --- Политика выдачи (риск-менеджмент) ---
+    # Проверки идут ДО запроса в GAMEAU: списанные USDT обратно не вернуть.
+    # 0 = проверка выключена.
+    max_order_revenue_rub: float = 0.0
+    min_margin_pct: float = 0.0
+    daily_spend_limit_usdt: float = 0.0
+    # «тот же ник и то же количество» в этом окне = подозрение на дубль заказа
+    duplicate_window_min: int = 15
+    duplicate_action: str = "alert"  # alert | hold | ignore
+    blacklist_enabled: bool = True  # стоп-лист покупателей (--blacklist)
+    # Шаблоны ответов покупателю; пустая строка = не отправлять
+    reply_need_username: str = (
+        "Здравствуйте! Не удалось автоматически распознать ваш Telegram @username. "
+        "Пожалуйста, напишите его ответным сообщением в формате: @username"
+    )
+    reply_delivered: str = (
+        "✅ Здравствуйте! {quantity_spaces} Telegram Stars успешно зачислены на аккаунт @{username}.\n\n"
+        "Пожалуйста, проверьте баланс в Telegram и подтвердите успешное выполнение заказа на FunPay! "
+        "Спасибо за покупку!"
+    )
+    reply_hold: str = ""
+    reply_error: str = ""
+
+    # --- Уведомления и мониторинг ---
+    # «Тихие часы» для некритичных алертов, напр. 23-07 (кросс-полуночные работают);
+    # ошибки выдачи, низкий баланс и зависшие задачи проходят всегда
+    mute_hours: str = ""
+    metrics_enabled: bool = False
+    metrics_host: str = "127.0.0.1"
+    metrics_port: int = 9155
+    metrics_token: str = ""
 
     # --- Хранилище / логи ---
     db_path: str = "autostars.db"
@@ -453,6 +507,49 @@ class Config:
         return bool(self.telegram_bot_token.strip() and str(self.telegram_chat_id).strip())
 
     # ------------------------------------------------------------------ #
+    # Политика выдачи и уведомления
+    # ------------------------------------------------------------------ #
+    def reply_templates(self) -> ReplyTemplates:  # noqa: F821 - тип из services.policy
+        from .services.policy import ReplyTemplates
+
+        return ReplyTemplates(
+            need_username=self.reply_need_username,
+            delivered=self.reply_delivered,
+            hold=self.reply_hold,
+            error=self.reply_error,
+        )
+
+    def order_policy(self) -> OrderPolicy:  # noqa: F821
+        """Собирает объект политики (см. autostars/services/policy.py)."""
+        from .services.policy import OrderPolicy
+
+        return OrderPolicy(
+            max_order_revenue_rub=float(self.max_order_revenue_rub or 0),
+            min_margin_pct=float(self.min_margin_pct or 0),
+            daily_spend_limit_usdt=float(self.daily_spend_limit_usdt or 0),
+            duplicate_window_min=int(self.duplicate_window_min or 0),
+            duplicate_action=str(self.duplicate_action or "alert"),
+            blacklist_enabled=bool(self.blacklist_enabled),
+            rate_rub_per_usdt=self.active_usdt_rate,
+            templates=self.reply_templates(),
+        )
+
+    def mute_window(self) -> tuple[int, int] | None:
+        """«Тихие часы» из `MUTE_HOURS` ("23-07", "23:00-07:00") или None."""
+        return parse_mute_window(self.mute_hours)
+
+    def is_muted(self, moment: float | None = None) -> bool:
+        """Сейчас «тихие часы»? (критичные алерты этим не подавляются)"""
+        window = self.mute_window()
+        if not window:
+            return False
+        import time as _time
+
+        hour = _time.localtime(moment if moment is not None else _time.time()).tm_hour
+        start, end = window
+        return hour >= start or hour < end if start > end else start <= hour < end
+
+    # ------------------------------------------------------------------ #
     # Диагностика
     # ------------------------------------------------------------------ #
     def validate(self) -> None:
@@ -497,6 +594,28 @@ class Config:
             out.append("TELEGRAM_CHAT_ID выглядит нечисловым — алерты могут не дойти")
         if not self.telegram_enabled:
             out.append("Telegram не настроен — уведомления владельцу и TG-команды выключены")
+        # политика выдачи и мелкая операционка
+        if self.duplicate_action.lower() not in {"alert", "hold", "ignore"}:
+            out.append(
+                f"DUPLICATE_ACTION={self.duplicate_action!r} — допустимо alert | hold | ignore "
+                "(используется alert)"
+            )
+        if self.max_order_revenue_rub <= 0 and self.daily_spend_limit_usdt <= 0:
+            out.append(
+                "Все лимиты выдачи (MAX_ORDER_REVENUE_RUB, DAILY_SPEND_LIMIT_USDT) выключены — "
+                "политика guardит только дубли, стоп-лист и отрицательную маржу"
+            )
+        if self.min_margin_pct > 90:
+            out.append(f"MIN_MARGIN_PCT={self.min_margin_pct:g} подозрительно высокий — заказы будут задерживаться")
+        if self.mute_hours and parse_mute_window(self.mute_hours) is None:
+            out.append(f"MUTE_HOURS={self.mute_hours!r} не читается — нужен формат «23-07» (часы 0..23); подавления нет")
+        if self.metrics_enabled and not self.metrics_token:
+            host = str(self.metrics_host or "").strip().lower()
+            if host not in {"127.0.0.1", "localhost", "::1"}:
+                out.append(
+                    f"METRICS_HOST={self.metrics_host!r} с открытым портом без METRICS_TOKEN — "
+                    "снимок читают все; поставьте токен или верните 127.0.0.1"
+                )
         for message in self.parse_errors:
             out.append(message)
         return out
@@ -522,6 +641,30 @@ class Config:
             f"maxCharge ≥ {self.default_max_charge_usdt:.2f} USDT (+{self.max_charge_margin_pct:g}%) | "
             f"poll {self.poll_interval:g}s | TG {'вкл' if self.telegram_enabled else 'выкл'}"
         )
+
+
+def parse_mute_window(spec: object) -> tuple[int, int] | None:
+    """
+    Часы «тихих часов» владельца: `"23-07"`, `"23:00-07:00"`, `"23 до 7"` → `(23, 7)`.
+
+    Пустое и нечитаемое значение → None, то есть подавление выключено (безопаснее по
+    умолчанию: владельцу приходят все алерты). Начало больше конца — окно через
+    полночь; «23-23» — нулевая длина, тоже считается выключенным.
+    """
+    raw = str(spec or "").strip()
+    if not raw:
+        return None
+    match = re.match(
+        r"^(\d{1,2})(?:[:.]?(\d{2}))?\s*(?:-|–|—|to|до)\s*(\d{1,2})(?:[:.]?(\d{2}))?$",
+        raw,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    start, end = int(match.group(1)) % 24, int(match.group(3)) % 24
+    if start == end:
+        return None
+    return start, end
 
 
 def mask_secret(value: str, keep: int = 4) -> str:

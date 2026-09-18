@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,7 +61,14 @@ STATUS_LABELS = {
     "FAILED_PRICE_EXCEEDED": ("цена выше лимита", THEME["warn"]),
     "FAILED_DELIVERY": ("GAMEAU отклонил", THEME["err"]),
     "CANCELLED": ("отменён", THEME["muted"]),
+    "HOLD_MANUAL": ("задержан политикой", THEME["warn"]),
 }
+
+
+def _nick(value: Any) -> str:
+    """Ник покупателя для таблиц: в БД он без '@', в выгрузке может быть с '@'."""
+    text = str(value or "").strip().lstrip("@")
+    return f"@{text}" if text else "?"
 
 
 def _icon(name: str) -> Any:
@@ -90,6 +98,19 @@ class AutoStarsApp:
         self.settings_error: ft.Text | None = None
         self.last_stats: dict[str, Any] | None = None
         self.selected_order: str | None = None
+        # деньги с вкладки «Выдача» тратятся только вторым кликом по той же кнопке
+        self._release_armed: str | None = None
+        self._cancel_armed: str | None = None
+        self.spend_tile: Any = None
+        self.spend_hint: Any = None
+        self.policy_tile: Any = None
+        self.held_table: Any = None
+        self.held_note: Any = None
+        self.blacklist_input: Any = None
+        self.blacklist_note_field: Any = None
+        self.blacklist_view: Any = None
+        self.export_period: Any = None
+        self.export_note: Any = None
 
     # ------------------------------------------------------------------ #
     # утилиты UI
@@ -326,6 +347,317 @@ class AutoStarsApp:
         )
 
     # ------------------------------------------------------------------ #
+    # вкладка «Выдача»: политика, задержанные заказы, стоп-лист, выгрузка
+    # ------------------------------------------------------------------ #
+    def build_delivery(self) -> ft.Container:
+        self.spend_tile = ft.Text("—", size=17, weight=ft.FontWeight.BOLD)
+        self.spend_hint = ft.Text("", size=11.5, color=THEME["muted"])
+        self.policy_tile = ft.Text("—", size=12.5, color=THEME["text"])
+        self.held_note = ft.Text("", size=12, color=THEME["muted"])
+        self.held_table = ft.DataTable(
+            columns=[
+                ft.DataColumn(ft.Text("заказ")),
+                ft.DataColumn(ft.Text("получатель")),
+                ft.DataColumn(ft.Text("⭐")),
+                ft.DataColumn(ft.Text("₽ выручка")),
+                ft.DataColumn(ft.Text("почему держим")),
+                ft.DataColumn(ft.Text("действия")),
+            ],
+            rows=[],
+            heading_row_color=THEME["surface2"],
+            border=ft.Border.all(1, THEME["line"]),
+            border_radius=8,
+            column_spacing=16,
+        )
+        self.blacklist_input = ft.TextField(label="@ник покупателя", width=220, text_size=13, dense=True,
+                                            border_radius=8)
+        self.blacklist_note_field = ft.TextField(label="причина (необязательно)", width=260, text_size=13,
+                                                 dense=True, border_radius=8)
+        self.blacklist_view = ft.ListView(height=110, spacing=2)
+        self.export_period = ft.Dropdown(
+            label="период",
+            width=150,
+            value="7d",
+            options=[ft.dropdown.Option(key=k, text=t) for k, t in
+                     (("all", "всё"), ("1d", "сутки"), ("7d", "неделя"), ("30d", "30 дней"))],
+            dense=True,
+            text_size=13,
+        )
+        self.export_note = ft.Text(
+            "CSV в кодировке utf-8-sig — открывается в Excel без «кракозябр». "
+            "Файл пишется в папку рядом с базой.",
+            size=11.5,
+            color=THEME["muted"],
+        )
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            self._button("🔄  Обновить", self.on_delivery, _icon("REFRESH")),
+                            self._button("🛡  Что проверяет политика (--limits)", self.on_limits, _icon("SHIELD")),
+                        ]
+                    ),
+                    self._panel(
+                        ft.Row(
+                            [
+                                ft.Column(
+                                    [ft.Text("ПОТРАЧЕНО С ПОЛУНОЧИ", size=10.5, color=THEME["muted"],
+                                            weight=ft.FontWeight.BOLD), self.spend_tile, self.spend_hint],
+                                    spacing=2,
+                                ),
+                                ft.VerticalDivider(width=1, color=THEME["line"]),
+                                ft.Column([self.policy_tile], spacing=2, expand=True),
+                            ],
+                            spacing=18,
+                        ),
+                        title="Политика выдачи",
+                    ),
+                    self._panel(
+                        self.held_note,
+                        ft.Column([self.held_table], scroll=ft.ScrollMode.AUTO),
+                        title="⛔ Задержанные заказы",
+                    ),
+                    self._panel(
+                        ft.Row([self.blacklist_input, self.blacklist_note_field]),
+                        ft.Row(
+                            [
+                                self._button("🚫  В стоп-лист", self.on_blacklist_add, _icon("BLOCK")),
+                                self._button("✅  Убрать из списка", self.on_blacklist_remove, _icon("CHECK")),
+                            ]
+                        ),
+                        self.blacklist_view,
+                        title="Чёрный список покупателей",
+                    ),
+                    self._panel(
+                        ft.Row(
+                            [
+                                self.export_period,
+                                self._button("⬇  Выгрузить CSV", self.on_export, _icon("DOWNLOAD")),
+                                self._button("⬇  Только проблемные", self.on_export_failed, _icon("WARNING")),
+                            ]
+                        ),
+                        self.export_note,
+                        title="Выгрузка истории",
+                    ),
+                ],
+                spacing=12,
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+            ),
+            padding=16,
+        )
+
+    def on_delivery(self, _e: Any = None) -> None:
+        """Снимок по политике: сколько потрачено, что задержано, кто в стоп-листе."""
+
+        def worker() -> dict[str, Any]:
+            cfg = bridge.load_config()
+            return {
+                "held": bridge.read_held_orders(cfg.db_path, limit=20),
+                "spent": bridge.read_spend_today_usdt(cfg.db_path),
+                "limit": float(cfg.daily_spend_limit_usdt or 0),
+                "flags": bridge.read_buyer_flags(cfg.db_path),
+                "max_order": float(cfg.max_order_revenue_rub or 0),
+                "min_margin": float(cfg.min_margin_pct or 0),
+                "duplicates": int(cfg.duplicate_window_min or 0),
+                "duplicate_action": str(cfg.duplicate_action or "alert"),
+                "blacklist": bool(cfg.blacklist_enabled),
+                "mute": str(cfg.mute_hours or ""),
+            }
+
+        self._run_async(worker, self._render_delivery)
+
+    def _render_delivery(self, data: dict[str, Any]) -> None:
+        spent, limit = data.get("spent"), float(data.get("limit") or 0)
+        if self.spend_tile is not None:
+            if spent is None:
+                self.spend_tile.value = "нет базы"
+                self.spend_hint.value = "движок ещё ничего не писал в SQLite"
+            else:
+                self.spend_tile.value = f"{spent:.2f} USDT"
+                if limit > 0:
+                    over = spent > limit
+                    self.spend_tile.color = THEME["err"] if over else THEME["ok"]
+                    self.spend_hint.value = (
+                        f"лимит {limit:.2f} · {'превышен — новые сделки держим' if over else f'осталось {max(0.0, limit - spent):.2f}'}"
+                    )
+                else:
+                    self.spend_tile.color = THEME["text"]
+                    self.spend_hint.value = "суточный лимит выключен (DAILY_SPEND_LIMIT_USDT=0)"
+        if self.policy_tile is not None:
+            bits = [
+                f"сделка ≤ {data['max_order']:.0f} ₽" if data["max_order"] > 0 else "лимит сделки выключен",
+                f"маржа ≥ {data['min_margin']:.1f}%" if data["min_margin"] > 0 else "маржа не проверяется",
+                f"дубли {data['duplicates']} мин → {data['duplicate_action']}" if data["duplicates"] > 0
+                else "дубли не ищем",
+                f"стоп-лист {'вкл' if data['blacklist'] else 'выкл'}",
+            ]
+            if data.get("mute"):
+                bits.append(f"тихие часы {data['mute']}")
+            self.policy_tile.value = "\n".join(bits)
+        if self.held_table is not None:
+            rows: list[ft.DataRow] = []
+            for item in data.get("held") or []:
+                order_id = str(item.get("order_id") or "")
+                rows.append(
+                    ft.DataRow(
+                        cells=[
+                            ft.DataCell(ft.Text(order_id, size=12, selectable=True)),
+                            ft.DataCell(ft.Text(_nick(item.get("username")), size=12)),
+                            ft.DataCell(ft.Text(str(item.get("quantity") or 0), size=12)),
+                            ft.DataCell(ft.Text(f"{float(item.get('price_rub') or 0):.2f}", size=12)),
+                            ft.DataCell(ft.Text(str(item.get("error") or "")[:90], size=11.5,
+                                                 color=THEME["warn"])),
+                            ft.DataCell(
+                                ft.Row(
+                                    [
+                                        ft.IconButton(
+                                            _icon("PLAY_CIRCLE"),
+                                            tooltip="отпустить и выдать (купит звёзды!)",
+                                            on_click=lambda _e, oid=order_id: self.release_order(oid),
+                                        ),
+                                        ft.IconButton(
+                                            _icon("CLOSE"),
+                                            tooltip="отклонить заказ (деньги не списывались)",
+                                            on_click=lambda _e, oid=order_id: self.cancel_order(oid),
+                                        ),
+                                    ],
+                                    spacing=0,
+                                )
+                            ),
+                        ]
+                    )
+                )
+            self.held_table.rows = rows
+            held_count = len(rows)
+            self.held_note.value = (
+                "Заказов ждёт решения: "
+                + (f"{held_count}. ▶ — выдать (идемпотентно, дубль покупки невозможен), ✖ — отклонить."
+                   if held_count else "нет 🎉")
+            )
+        if self.blacklist_view is not None:
+            self.blacklist_view.controls.clear()
+            flags = data.get("flags") or []
+            if not flags:
+                self.blacklist_view.controls.append(
+                    ft.Text("стоп-лист пуст", size=12, color=THEME["muted"])
+                )
+            for row in flags:
+                self.blacklist_view.controls.append(
+                    ft.Text(
+                        f"{row.get('username')}  •  {row.get('note') or 'без причины'}",
+                        size=12,
+                    )
+                )
+        with contextlib.suppress(Exception):
+            if self.page is not None:
+                self.page.update()
+
+    def on_limits(self, _e: Any = None) -> None:
+        """Вывод `--limits` в «Диагностику» — там же, где остальной вывод движка."""
+        self._run_cli_button(("--limits", "политика выдачи", THEME["accent"]), into_diag=True)
+
+    def release_order(self, order_id: str) -> None:
+        """Второй клик = подтверждение: трата денег с вкладки не должна быть случайной."""
+        if self._release_armed != order_id:
+            self._release_armed = order_id
+            self._set_status(f"нажмите ещё раз для #{order_id} — будут куплены звёзды", THEME["warn"])
+            return
+        self._release_armed = None
+        self._set_status(f"отпускаю заказ #{order_id}…", THEME["accent"])
+
+        def worker() -> bridge.CommandResult:
+            return bridge.run_cli("--release", order_id, "-y", timeout=240)
+
+        def done(result: bridge.CommandResult) -> None:
+            self._show_diag(result.output or "(нет вывода)")
+            self._set_status(
+                ("✅ " if result.ok else "⚠️ ") + f"заказ #{order_id} ({result.returncode})",
+                THEME["ok"] if result.ok else THEME["err"],
+            )
+            self.on_delivery()
+            self.on_orders()
+
+        self._run_async(worker, done)
+
+    def cancel_order(self, order_id: str) -> None:
+        if self._cancel_armed != order_id:
+            self._cancel_armed = order_id
+            self._set_status(f"нажмите ещё раз, чтобы отклонить #{order_id}", THEME["warn"])
+            return
+        self._cancel_armed = None
+
+        def worker() -> bridge.CommandResult:
+            return bridge.run_cli("--cancel", order_id, "-y", timeout=120)
+
+        def done(result: bridge.CommandResult) -> None:
+            self._show_diag(result.output or "(нет вывода)")
+            self._set_status("отклонено" if result.ok else "не отклонено", THEME["ok"] if result.ok else THEME["err"])
+            self.on_delivery()
+            self.on_orders()
+
+        self._run_async(worker, done)
+
+    def on_blacklist_add(self, _e: Any = None) -> None:
+        nick = (self.blacklist_input.value or "").strip()
+        if not nick:
+            self._set_status("укажите @ник покупателя", THEME["warn"])
+            return
+        note = (self.blacklist_note_field.value or "").strip()
+        args = ["--blacklist", "add", nick] + ([note] if note else [])
+
+        def worker() -> bridge.CommandResult:
+            return bridge.run_cli(*args, timeout=90)
+
+        self._run_async(worker, lambda result: (self._show_diag(result.output), self.on_delivery()))
+        self._set_status(f"добавляю @{nick.lstrip('@')} в стоп-лист…", THEME["accent"])
+
+    def on_blacklist_remove(self, _e: Any = None) -> None:
+        nick = (self.blacklist_input.value or "").strip()
+        if not nick:
+            self._set_status("укажите @ник покупателя", THEME["warn"])
+            return
+
+        def worker() -> bridge.CommandResult:
+            return bridge.run_cli("--blacklist", "remove", nick, timeout=90)
+
+        self._run_async(worker, lambda result: (self._show_diag(result.output), self.on_delivery()))
+        self._set_status(f"убираю @{nick.lstrip('@')} из стоп-листа…", THEME["accent"])
+
+    def on_export(self, _e: Any = None) -> None:
+        self._export(failed=False)
+
+    def on_export_failed(self, _e: Any = None) -> None:
+        self._export(failed=True)
+
+    def _export(self, *, failed: bool) -> None:
+        period = str(self.export_period.value or "all")
+
+        def worker() -> bridge.CommandResult:
+            cfg = bridge.load_config()
+            stamp = datetime.now().strftime("%Y%m%d-%H%M")
+            name = f"autostars-{'failed' if failed else 'orders'}-{stamp}.csv"
+            target = Path(cfg.db_path).resolve().parent / name
+            args = ["--export", str(target)]
+            if period and period != "all":
+                args += ["--since", period]
+            if failed:
+                args.append("--failed")
+            return bridge.run_cli(*args, timeout=180)
+
+        def done(result: bridge.CommandResult) -> None:
+            self._show_diag(result.output or "(нет вывода)")
+            self.export_note.value = (result.output or "").strip().splitlines()[0] if result.output else "—"
+            self._set_status("выгрузка готова" if result.ok else "выгрузка не удалась",
+                             THEME["ok"] if result.ok else THEME["err"])
+            with contextlib.suppress(Exception):
+                self.export_note.update()
+
+        self._run_async(worker, done)
+
+    # ------------------------------------------------------------------ #
     # вкладка «Настройки»
     # ------------------------------------------------------------------ #
     def build_settings(self) -> ft.Container:
@@ -400,6 +732,20 @@ class AutoStarsApp:
                 width=320,
                 text_size=13,
                 dense=True,
+            )
+        if field.kind == "longtext":
+            return ft.TextField(
+                label=field.label,
+                value=value,
+                multiline=True,
+                min_lines=2,
+                max_lines=8,
+                shift_enter=True,
+                helper=ft.Text(field.help, size=11, color=THEME["muted"]) if field.help else None,
+                text_size=13,
+                dense=True,
+                border_radius=8,
+                width=560,
             )
         return ft.TextField(
             label=field.label,
@@ -861,11 +1207,12 @@ class AutoStarsApp:
             if icon.exists():
                 page.window.icon = str(icon)
 
-        tab_names = ["Главная", "Статистика", "Заказы", "Настройки", "Логи", "Диагностика"]
+        tab_names = ["Главная", "Статистика", "Заказы", "Выдача", "Настройки", "Логи", "Диагностика"]
         tab_builders = [
             self.build_dashboard,
             self.build_stats,
             self.build_orders,
+            self.build_delivery,
             self.build_settings,
             self.build_logs,
             self.build_diag,

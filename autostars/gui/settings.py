@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from autostars.config import PLACEHOLDERS, env_path, parse_env_text
+from autostars.config import ENV_MAP, PLACEHOLDERS, Config, env_path, parse_env_text
 
 BACKUP_SUFFIX = ".bak"
 
@@ -30,7 +30,7 @@ class SettingField:
 
     key: str
     label: str
-    kind: str = "text"  # text | secret | number | int | bool | choice
+    kind: str = "text"  # text | secret | number | int | bool | choice | longtext
     help: str = ""
     choices: tuple[str, ...] = ()
     min_value: float | None = None
@@ -39,7 +39,17 @@ class SettingField:
     default: str = ""
 
 
-SECTION_KEYS = ("Общее", "FunPay", "GAMEAU", "Финансы", "Telegram", "Надёжность", "Логи и БД")
+SECTION_KEYS = (
+    "Общее",
+    "FunPay",
+    "GAMEAU",
+    "Финансы",
+    "Telegram",
+    "Надёжность",
+    "Политика выдачи",
+    "Ответы покупателю",
+    "Логи и БД",
+)
 
 
 FIELDS: list[SettingField] = [
@@ -129,6 +139,49 @@ FIELDS: list[SettingField] = [
     SettingField("SHUTDOWN_TIMEOUT_SEC", "Таймаут graceful shutdown, сек", "int",
                  "Сколько ждать текущие выдачи при остановке/`stop`.", min_value=1, max_value=600,
                  default="30", section="Надёжность"),
+    # --- Политика выдачи (защита от убытка) ---
+    SettingField("MAX_ORDER_REVENUE_RUB", "Лимит сделки, ₽ (0 = выкл)", "number",
+                 "Заказ с выручкой больше этой суммы задерживается до вашего решения.",
+                 min_value=0, default="0", section="Политика выдачи"),
+    SettingField("MIN_MARGIN_PCT", "Минимальная маржа, % (0 = выкл)", "number",
+                 "Ниже порога заказ задерживается. Считается по курсу выбранного варианта обмена.",
+                 min_value=0, max_value=100, default="0", section="Политика выдачи"),
+    SettingField("DAILY_SPEND_LIMIT_USDT", "Суточный бюджет закупки, USDT (0 = выкл)", "number",
+                 "Суммарные списания с полуночи: превысили — держим, а не покупаем.",
+                 min_value=0, default="0", section="Политика выдачи"),
+    SettingField("DUPLICATE_WINDOW_MIN", "Окно поиска дублей, минут", "int",
+                 "0 — не искать. Тот же ник и то же количество в окне = подозрение на дубль.",
+                 min_value=0, max_value=1440, default="15", section="Политика выдачи"),
+    SettingField("DUPLICATE_ACTION", "Дубль: что делать", "choice",
+                 "alert — предупредить и выдать; hold — задержать; ignore — не реагировать.",
+                 choices=("alert", "hold", "ignore"), default="alert", section="Политика выдачи"),
+    SettingField("BLACKLIST_ENABLED", "Учитывать чёрный список покупателей", "bool",
+                 "Задерживает заказы ником из стоп-листа (кнопка на вкладке «Выдача»).",
+                 default="true", section="Политика выдачи"),
+    SettingField("MUTE_HOURS", "Тихие часы для некритичных алертов", "text",
+                 "Например 23-07 или 23:00-07:00. Ошибки, низкий баланс и задержки приходят всегда.",
+                 default="", section="Политика выдачи"),
+    SettingField("METRICS_ENABLED", "Метрики Prometheus / healthz", "bool",
+                 "Выключено по умолчанию; слушает только METRICS_HOST (127.0.0.1).",
+                 default="false", section="Политика выдачи"),
+    SettingField("METRICS_HOST", "Метрики: адрес", "text", "Наружу не выставляйте без reverse-proxy.",
+                 default="127.0.0.1", section="Политика выдачи"),
+    SettingField("METRICS_PORT", "Метрики: порт", "int", "", min_value=1, max_value=65535,
+                 default="9155", section="Политика выдачи"),
+    SettingField("METRICS_TOKEN", "Метрики: Bearer-токен", "secret",
+                 "Пусто — доступ без пароля (ок для localhost).", section="Политика выдачи"),
+    # --- Ответы покупателю (шаблоны) ---
+    SettingField("REPLY_NEED_USERNAME", "Ответ: нужен @username", "longtext",
+                 "Пусто — не отправляем. Подстановки: {username} {quantity} {quantity_spaces} {order_id} {price_rub}",
+                 default="", section="Ответы покупателю"),
+    SettingField("REPLY_DELIVERED", "Ответ: звёзды зачислены", "longtext",
+                 "Пусто — не отправляем.", default="", section="Ответы покупателю"),
+    SettingField("REPLY_HOLD", "Ответ: заказ задержан", "longtext",
+                 "Пусто — молчим. Есть смысл, если покупатели спрашивают, почему долго.",
+                 default="", section="Ответы покупателю"),
+    SettingField("REPLY_ERROR", "Ответ: выдача не удалась", "longtext",
+                 "Пусто — молчим. Помните об обещаниях возврата: текст = публичное обязательство.",
+                 default="", section="Ответы покупателю"),
     # --- Логи и БД ---
     SettingField("DB_PATH", "Путь к базе SQLite", "text", "Можно абсолютный (для Docker/systemd).",
                  default="autostars.db", section="Логи и БД"),
@@ -151,6 +204,24 @@ def target_env_file() -> Path:
     return env_path()
 
 
+#: Плейсхолдеры, которые понимает `ReplyTemplates.render` (services/policy.py).
+TEMPLATE_PLACEHOLDERS = ("username", "quantity", "quantity_spaces", "order_id", "price_rub", "reason")
+
+
+def engine_default_for(key: str) -> str:
+    """Значение по умолчанию самого движка для ключа .env (для шаблонов).
+
+    Нужно, чтобы поле формы показывало реальное поведение: если REPLY_DELIVERED в
+    файле нет, движок использует встроенный текст, и пустое поле означало бы
+    «выключить ответ покупателю» — обидная ловушка при «сохранил как есть».
+    """
+    attr = ENV_MAP.get(key)
+    if not attr:
+        return ""
+    default = getattr(Config(), attr, "")
+    return "" if isinstance(default, bool) else str(default or "")
+
+
 def read_settings(path: Path | None = None) -> dict[str, str]:
     values: dict[str, str] = {}
     file_path = path or target_env_file()
@@ -165,6 +236,10 @@ def read_settings(path: Path | None = None) -> dict[str, str]:
 
 def display_value(field: SettingField, values: dict[str, str]) -> str:
     """Значение для поля формы ('' для секрета — чтобы не показывать и не затирать)."""
+    if field.kind == "longtext":
+        # ключ отсутствовал в .env → показываем текст движка, а не пустоту
+        raw = values.get(field.key)
+        return engine_default_for(field.key) if raw is None else raw
     raw = values.get(field.key, "")
     if raw.strip() in PLACEHOLDERS:
         raw = ""
@@ -198,6 +273,19 @@ def validate(fields_values: dict[str, str], known: list[SettingField] | None = N
             errors.append(f"{field.label}: допустимо {', '.join(field.choices)}")
         elif field.kind == "bool" and raw.lower() not in _BOOL_TRUE | {"0", "false", "no", "off", "нет"}:
             errors.append(f"{field.label}: для переключателя нужно «да» или «нет»")
+        elif field.kind == "longtext":
+            unknown = sorted(
+                {
+                    name
+                    for name in re.findall(r"\{(\w+)\}", raw)
+                    if name not in TEMPLATE_PLACEHOLDERS
+                }
+            )
+            if unknown:
+                errors.append(
+                    f"{field.label}: неизвестная подстановка {{{unknown[0]}}} — "
+                    "такой текст уйдёт покупателю как есть"
+                )
     return errors
 
 
@@ -212,6 +300,8 @@ def normalize(field: SettingField, raw: str) -> str:
     if field.kind == "number":
         with contextlib.suppress(ValueError):
             return f"{float(value.replace(',', '.')):g}"
+    if field.kind == "longtext":
+        return "\n".join(line.rstrip() for line in value.splitlines()).strip()
     return value
 
 
@@ -222,13 +312,37 @@ def plan_updates(fields_values: dict[str, str], current: dict[str, str]) -> dict
         if field.key not in fields_values:
             continue
         raw = fields_values[field.key]
-        if field.kind == "secret" and not (raw or "").strip():
+        if field.kind in ("secret",) and not (raw or "").strip():
             continue
         new_value = normalize(field, raw)
         if new_value == (current.get(field.key) or "").strip():
             continue
+        if field.kind == "longtext" and field.key not in current and new_value == engine_default_for(field.key):
+            # ключ в .env отсутствует и пользователь ничего не поменял:
+            # движок и так использует этот текст — не плодим строку и лишний .bak
+            continue
         updates[field.key] = new_value
     return updates
+
+
+def _render_value(value: str) -> str:
+    """Как записать значение в .env, чтобы многострочный текст не сломал файл.
+
+    Движок (parse_env_text) разворачивает \n и \" только внутри двойных кавычек,
+    поэтому переносы строк и кавычки экранируем и оборачиваем — файл остаётся
+    построчным, а шаблон сохраняется как был.
+    """
+    text = value if value is not None else ""
+    if "\n" not in text and "\r" not in text and '"' not in text:
+        return text
+    escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
 
 
 def apply_updates(updates: dict[str, str], path: Path | None = None, backup: bool = True) -> tuple[Path, int]:
@@ -253,7 +367,7 @@ def apply_updates(updates: dict[str, str], path: Path | None = None, backup: boo
     current = parse_env_text("\n".join(lines)) if lines else {}
     changed = 0
     for key, value in updates.items():
-        rendered = f"{key}={value}"
+        rendered = f"{key}={_render_value(value)}"
         if key in seen:
             # сравнение по смыслу, а не по строке: «5.0» уже записано, хотя в файле
             # стоит «5.0  # коммент» — не теряем комментарий и не делаем лишний бэкап

@@ -314,7 +314,7 @@ class MockNotifier:
         r = rate or self.current_rate
         return round(order_price_rub - (usdt_cost * r), 2)
 
-    async def send_alert(self, text, parse_mode="HTML"):
+    async def send_alert(self, text, parse_mode="HTML", *, critical=True):
         self.alerts.append(text)
         return True
 
@@ -473,7 +473,7 @@ class ReconcileMockNotifier(MockNotifier):
         super().__init__()
         self.stuck_alerts = 0
 
-    async def send_alert(self, text, parse_mode="HTML"):
+    async def send_alert(self, text, parse_mode="HTML", *, critical=True):
         self.alerts.append(text)
         if "ЗАВИСШАЯ ЗАДАЧА" in text:
             self.stuck_alerts += 1
